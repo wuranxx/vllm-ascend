@@ -301,6 +301,19 @@ def main(input_fp8_hf_path: str, output_hf_path: str, config_path: str) -> None:
             else:
                 writer.write(weight_name, weight, QUANT_TYPE_FLOAT)
 
+            # MTP shared weights: vLLM loads MTP as a separate model instance that
+            # only accepts weights with "mtp.0." prefix. The embedding and head
+            # are shared with the main model in training (tie_weight), but at
+            # deployment each model instance needs its own copy in the safetensors
+            # file. FP8 path auto-renames these in vLLM; W8A8 path does not, so
+            # we duplicate them here (matches msmodelslim warp_mtp_model behavior).
+            # clone() is required because safetensors rejects tensors sharing the
+            # same storage in the same shard.
+            if weight_name == "embed.weight":
+                writer.write("mtp.0.emb.tok_emb.weight", weight.clone(), QUANT_TYPE_FLOAT)
+            elif weight_name == "head.weight":
+                writer.write("mtp.0.head.weight", weight.clone(), QUANT_TYPE_FLOAT)
+
         # Memory management: keep only the most recently used shards.
         # Use while (not if) because get_tensor() may pull in multiple scale
         # shards beyond the current one, so we evict until we're back at the limit.
