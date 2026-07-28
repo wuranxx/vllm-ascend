@@ -29,13 +29,23 @@ from tqdm import tqdm
 NUM_BITS = 8
 Q_MAX = 2 ** (NUM_BITS - 1) - 1  # 127
 Q_MIN = -(2 ** (NUM_BITS - 1))  # -128
+# Epsilon to prevent division by zero when the input is all zeros
+QUANT_EPSILON = 1e-5
 
 # FP8 block size for dequantization (DeepSeek-V4 uses 128x128 blocks)
 FP8_BLOCK_SIZE = 128
+# MXFP4 block size: 32 FP4 elements (packed into 16 uint8) share 1 block scale
+MXFP4_BLOCK_SIZE = 32
 
 # Output shard size (GB), matches YAML save.ascendv1_saver.part_file_size
 OUTPUT_SHARD_GB = 4
 ONE_GB_BYTES = 1073741824
+
+# Max number of input safetensors shards to keep in memory simultaneously.
+# FP8 weight and its scale may land in adjacent shards, so a window of 2 is
+# sufficient for the common case; get_tensor() may pull in extra scale shards
+# which are evicted by the while-loop after each iteration.
+MAX_CACHED_SHARDS = 2
 
 # Quant type strings for quant_model_description.json
 QUANT_TYPE_W8A8_DYNAMIC = "W8A8_DYNAMIC"
@@ -72,8 +82,9 @@ def decode_fp4(packed_fp4_data: torch.Tensor, block_scales: torch.Tensor) -> tor
     abs_idx = indices & 0x07
     values = sign * lut[abs_idx.long()]
 
-    # block_size = 2048 / 128 = 16, so repeat_interleave(32) expands scale to weight dim
-    scales_expanded = block_scales.to(torch.float32).repeat_interleave(32, dim=-1)
+    # MXFP4: 32 FP4 elements share 1 block scale, so repeat_interleave(32)
+    # expands block_scales to match the unpacked weight dimension
+    scales_expanded = block_scales.to(torch.float32).repeat_interleave(MXFP4_BLOCK_SIZE, dim=-1)
     return (values * scales_expanded).to(torch.bfloat16)
 
 
@@ -91,7 +102,7 @@ def weight_quant_sym_perchannel(tensor: torch.Tensor) -> tuple[torch.Tensor, tor
     xmax = torch.maximum(x.max(1)[0], tmp)
 
     # symmetric: take max of abs(xmin) and xmax, clamp to avoid div-by-zero
-    xmax = torch.maximum(torch.abs(xmin), xmax).clamp(min=1e-5)
+    xmax = torch.maximum(torch.abs(xmin), xmax).clamp(min=QUANT_EPSILON)
     scale = (xmax / Q_MAX).unsqueeze(-1)  # (M, 1) for broadcasting with x (M, N)
     zero = torch.zeros_like(scale)
 
@@ -257,9 +268,14 @@ def main(input_fp8_hf_path: str, output_hf_path: str, config_path: str) -> None:
                     scale_inv = get_tensor(scale_name)
                     if weight.dtype == torch.float8_e4m3fn:
                         weight = decode_fp8(weight, scale_inv)
-                    else:
+                    elif weight.dtype in (torch.int8, torch.uint8):
                         # MXFP4 packed as int8/uint8
                         weight = decode_fp4(weight, scale_inv)
+                    else:
+                        raise ValueError(
+                            f"Unexpected 1-byte dtype {weight.dtype} for {weight_name}; "
+                            "expected float8_e4m3fn (FP8) or int8/uint8 (MXFP4 packed)."
+                        )
                 except KeyError:
                     print(f"Warning: Missing scale tensor for {weight_name}, keeping original")
                     writer.write(weight_name, weight, QUANT_TYPE_FLOAT)
@@ -285,21 +301,49 @@ def main(input_fp8_hf_path: str, output_hf_path: str, config_path: str) -> None:
             else:
                 writer.write(weight_name, weight, QUANT_TYPE_FLOAT)
 
-        # Memory management: keep only the 2 most recently used files
-        if len(loaded_files) > 2:
+        # Memory management: keep only the most recently used shards.
+        # Use while (not if) because get_tensor() may pull in multiple scale
+        # shards beyond the current one, so we evict until we're back at the limit.
+        while len(loaded_files) > MAX_CACHED_SHARDS:
             oldest = next(iter(loaded_files))
             del loaded_files[oldest]
 
     writer.close()
 
+    # Post-quantization sanity checks (design.md risk 1: YAML glob matching)
+    # Only count weight entries (exclude top-level metadata like model_quant_type)
+    w8a8_weight_suffixes = (".weight", ".weight_scale", ".weight_offset")
+    w8a8_count = sum(
+        1
+        for k, v in writer.quant_description.items()
+        if v == QUANT_TYPE_W8A8_DYNAMIC and k.endswith(w8a8_weight_suffixes)
+    )
+    assert w8a8_count > 0, "No weights were quantized — check YAML config include patterns"
+    assert w8a8_count % 3 == 0, (
+        f"W8A8_DYNAMIC weight entry count ({w8a8_count}) must be a multiple of 3 "
+        "(weight + weight_scale + weight_offset per quantized layer)"
+    )
+
     # Write config.json (without quantization_config)
     with open(os.path.join(output_hf_path, "config.json"), "w") as f:
         json.dump(config, f, indent=2)
 
-    # Copy non-safetensor files (tokenizer, modeling code, etc.)
+    # Copy non-safetensors files (tokenizer, modeling code, etc.)
+    # Skip config.json (already written above) and model.safetensors.index.json
+    # (stale — references input FP8 shard names that don't exist in the output;
+    # vllm's filter_duplicate_safetensors_files would use it to filter out all
+    # quant_model_weights-*.safetensors, causing "Cannot find any model weights").
+    # The script writes quant_model_weights.safetensors.index.json via writer.close(),
+    # and vllm falls back to globbing *.safetensors when model.safetensors.index.json
+    # is absent.
+    skip_files = {"config.json", "model.safetensors.index.json"}
+    copy_extensions = (".py", ".json", ".jinja")
     for root, _, files in os.walk(input_fp8_hf_path):
         for file in files:
-            if file.endswith((".py", ".json", ".jinja")) and file != "config.json":
+            if file in skip_files:
+                continue
+            # .gitattributes is a hidden file with no extension, copy by name
+            if file.endswith(copy_extensions) or file == ".gitattributes":
                 src = os.path.join(root, file)
                 rel_dir = os.path.relpath(root, input_fp8_hf_path)
                 dst_dir = os.path.join(output_hf_path, rel_dir)
