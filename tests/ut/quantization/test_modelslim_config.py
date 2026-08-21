@@ -16,6 +16,7 @@ from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
 from vllm_ascend.quantization.modelslim_config import (
     MODELSLIM_CONFIG_FILENAME,
     AscendModelSlimConfig,
+    get_linear_quant_type,
 )
 from vllm_ascend.utils import ASCEND_QUANTIZATION_METHOD, vllm_version_is
 
@@ -208,6 +209,89 @@ class TestAscendModelSlimConfig(TestBase):
         config = AscendModelSlimConfig(bad_config)
         with self.assertRaises(ValueError):
             config.is_layer_skipped_ascend("fused_layer", fused_mapping)
+
+    def test_init_with_none_config(self):
+        config = AscendModelSlimConfig(None)
+        self.assertEqual(config.quant_description, {})
+
+    def test_fake_mx_default_and_module_overrides(self):
+        quant_description = {
+            "default_quant_type": "W4A4_MXFP4_FAKE",
+            "module_quant_overrides": {
+                "*self_attn*": "W8A8_MXFP8_FAKE",
+                "*lm_head": "FLOAT",
+            },
+        }
+        config = AscendModelSlimConfig(quant_description)
+
+        self.assertEqual(
+            get_linear_quant_type(
+                quant_description,
+                "model.layers.0.self_attn.qkv_proj",
+                {"qkv_proj": ["q_proj", "k_proj", "v_proj"]},
+            ),
+            "W8A8_MXFP8_FAKE",
+        )
+        self.assertEqual(
+            get_linear_quant_type(quant_description, "model.layers.0.mlp.down_proj", {}),
+            "W4A4_MXFP4_FAKE",
+        )
+        self.assertFalse(config.is_layer_skipped_ascend("model.layers.0.mlp.down_proj"))
+        self.assertTrue(config.is_layer_skipped_ascend("lm_head"))
+
+    def test_explicit_layer_precision_overrides_fake_mx_default(self):
+        quant_description = {
+            "default_quant_type": "W4A4_MXFP4_FAKE",
+            "model.layers.0.mlp.down_proj.weight": "FLOAT",
+        }
+        config = AscendModelSlimConfig(quant_description)
+
+        self.assertEqual(
+            get_linear_quant_type(quant_description, "model.layers.0.mlp.down_proj", {}),
+            "FLOAT",
+        )
+        self.assertTrue(config.is_layer_skipped_ascend("model.layers.0.mlp.down_proj"))
+
+    def test_qwen35_9b_attn_linear_mixed_mx_precision_and_float_fallback(self):
+        quant_description = {
+            "default_quant_type": "W8A8_MXFP8_RHT_FAKE",
+            "module_quant_overrides": {
+                "*self_attn.qkv_proj*": "W4A4_MXFP4_RHT_FAKE",
+                "*self_attn.o_proj*": "W8A8_MXFP8_RHT_FAKE",
+                "*linear_attn.in_proj*": "W4A4_MXFP4_RHT_FAKE",
+                "*linear_attn.out_proj*": "W8A8_MXFP8_RHT_FAKE",
+                "*": "FLOAT",
+            },
+        }
+        packed = {
+            "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+            "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
+            "in_proj_ba": ["in_proj_b", "in_proj_a"],
+        }
+        config = AscendModelSlimConfig(quant_description)
+
+        cases = {
+            "model.layers.0.self_attn.qkv_proj": "W4A4_MXFP4_RHT_FAKE",
+            "model.layers.0.self_attn.o_proj": "W8A8_MXFP8_RHT_FAKE",
+            "model.layers.1.linear_attn.in_proj_qkvz": "W4A4_MXFP4_RHT_FAKE",
+            "model.layers.1.linear_attn.in_proj_ba": "W4A4_MXFP4_RHT_FAKE",
+            "model.layers.1.linear_attn.out_proj": "W8A8_MXFP8_RHT_FAKE",
+            "model.layers.0.mlp.down_proj": "FLOAT",
+        }
+        for prefix, expected in cases.items():
+            self.assertEqual(
+                get_linear_quant_type(quant_description, prefix, packed),
+                expected,
+            )
+
+        self.assertFalse(config.is_layer_skipped_ascend("model.layers.0.self_attn.qkv_proj", packed))
+        self.assertTrue(config.is_layer_skipped_ascend("model.layers.0.mlp.down_proj", packed))
+
+    def test_fake_mx_rejects_unsupported_default(self):
+        quant_description = {"default_quant_type": "W8A8_DYNAMIC"}
+
+        with self.assertRaisesRegex(ValueError, "default_quant_type only supports fake-MX"):
+            get_linear_quant_type(quant_description, "model.layers.0.mlp.down_proj", {})
 
     def test_init_with_default_config(self):
         config = AscendModelSlimConfig()

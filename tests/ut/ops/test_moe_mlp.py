@@ -5,7 +5,12 @@ from unittest.mock import patch
 import torch
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 
-from vllm_ascend.ops.fused_moe.moe_mlp import cumsum_group_list, unified_apply_mlp, unquant_apply_mlp
+from vllm_ascend.ops.fused_moe.moe_mlp import (
+    _apply_expert_learned_hadamard,
+    cumsum_group_list,
+    unified_apply_mlp,
+    unquant_apply_mlp,
+)
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEMlpComputeInput,
     MoEQuantParams,
@@ -48,6 +53,24 @@ class TestCumsumGroupList(unittest.TestCase):
                 with self.assertRaises(NotImplementedError) as excinfo:
                     cumsum_group_list(self.glist_dict[0], src_list_type, dst_list_type)
                 self.assertIn("This feature is under development.", str(excinfo.exception))
+
+    def test_hadamard_learning_selects_transform_after_expert_dispatch(self):
+        hidden_states = torch.tensor([[1.0, 0.0], [0.0, 1.0], [2.0, 3.0]])
+        transforms = torch.stack(
+            (
+                torch.eye(2),
+                torch.tensor([[0.0, 1.0], [1.0, 0.0]]),
+            )
+        )
+
+        actual = _apply_expert_learned_hadamard(
+            hidden_states,
+            transforms,
+            group_list=torch.tensor([2, 1]),
+            group_list_type=1,
+        )
+
+        torch.testing.assert_close(actual, torch.tensor([[1.0, 0.0], [0.0, 1.0], [3.0, 2.0]]))
 
 
 class TestW4A8RuntimeFlags(unittest.TestCase):

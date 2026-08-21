@@ -265,6 +265,48 @@ class TestMoERuntimeArgs(unittest.TestCase):
                 self.assertEqual(fused_experts_input.quant.mxfp.per_token_scale_dtype, torch.float16)
                 self.assertFalse(fused_experts_input.quant.mxfp.use_bf16)
 
+    def test_fake_mx_metadata_reaches_mlp_compute_input_without_enabling_native_quant(self):
+        fused_experts_input = build_fused_experts_input(
+            hidden_states=torch.randn(2, 8, dtype=torch.bfloat16),
+            topk_weights=torch.randn(2, 2),
+            topk_ids=torch.tensor([[0, 1], [1, 0]], dtype=torch.int32),
+            w1=torch.randn(2, 8, 16),
+            w2=torch.randn(2, 16, 8),
+            quant_type=QuantType.NONE,
+            dynamic_eplb=False,
+            fake_mx_format="mxfp4",
+            fake_mx_group_size=32,
+            fake_mx_algorithm="rht",
+            fake_mx_rht_signs=torch.ones(8, dtype=torch.int8),
+            fake_mx_rht_group_size=8,
+        )
+        token_dispatch_output = MoETokenDispatchOutput(
+            hidden_states=torch.randn(4, 8, dtype=torch.bfloat16),
+            group_list=torch.tensor([2, 2], dtype=torch.int64),
+            group_list_type=1,
+            combine_metadata=MoEAllGatherCombineMetadata(
+                topk_weights=fused_experts_input.topk_weights,
+                expanded_row_idx=torch.arange(4, dtype=torch.int32),
+                restore_shape=torch.Size([2, 8]),
+            ),
+        )
+
+        mlp_compute_input = build_mlp_compute_input(
+            fused_experts_input=fused_experts_input,
+            token_dispatch_output=token_dispatch_output,
+            use_fusion_ops=False,
+        )
+
+        self.assertFalse(mlp_compute_input.quant.is_quant)
+        self.assertEqual(mlp_compute_input.quant.fake_mx_format, "mxfp4")
+        self.assertEqual(mlp_compute_input.quant.fake_mx_group_size, 32)
+        self.assertEqual(mlp_compute_input.quant.fake_mx_algorithm, "rht")
+        self.assertEqual(mlp_compute_input.quant.fake_mx_rht_group_size, 8)
+        torch.testing.assert_close(
+            mlp_compute_input.quant.fake_mx_rht_signs,
+            torch.ones(8, dtype=torch.int8),
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
