@@ -1,0 +1,9 @@
+{
+  "default_quant_type": "W4A4_MXFP4_FAKE",
+  "group_size": 32,
+  "module_quant_overrides": {
+    "*mlp.gate_up_proj*": "W4A4_MXFP4_FAKE",
+    "*mlp.down_proj*": "W8A8_MXFP8_FAKE",
+    "*": "FLOAT"
+  }
+}

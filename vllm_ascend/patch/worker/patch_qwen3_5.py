@@ -35,11 +35,30 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
 from vllm_ascend.utils import is_310p
 
+# ============================================================================
+# Patch-layer fake-MX insertion reference (DISABLED)
+#
+# Patch mechanism: the module's bottom replaces forward methods directly:
+#   Qwen3NextAttention.forward = AscendQwen3NextAttention.forward
+#   Qwen3_5DecoderLayer.forward = AscendQwen3_5DecoderLayer.forward
+#
+# Each commented _qdq() line is the correct insertion point — right before
+# the Linear projection call it targets. Aligns with AMCT attn-linear + mlp.
+#
+# from vllm_ascend.quantization.fake_mx import fake_mx_quantize
+# _FMT = "mxfp4"
+# _GS = 32
+# def _qdq(t):
+#     return fake_mx_quantize(t, _FMT, _GS)
+# ============================================================================
+
 _GDN_PATCH_TARGET = _GDNBaseCls
 
 
 class AscendQwen3NextAttention(Qwen3NextAttention):
     def forward(self, positions: torch.Tensor, output: torch.Tensor, hidden_states: torch.Tensor):
+        # AMCT attn-linear: qkv_proj activation QDQ
+        # hidden_states = _qdq(hidden_states)
         qkv, _ = self.qkv_proj(hidden_states)
         if "qwen3_5" in self.config.model_type:
             cos_sin = self.rotary_emb.cos_sin_cache[positions]
@@ -84,7 +103,22 @@ class AscendQwen3NextAttention(Qwen3NextAttention):
             gate = torch.sigmoid(gate)
             attn_output = attn_output * gate
 
+        # AMCT attn-linear: o_proj activation QDQ
+        # attn_output = _qdq(attn_output)
         output[:], _ = self.o_proj(attn_output)
+
+
+# AMCT mlp: Dense MLP activation QDQ (DISABLED)
+# Patch Qwen3NextMLP.forward — same mechanism as Attention/DecoderLayer above.
+# from vllm.model_executor.models.qwen2_moe import Qwen3NextMLP
+# def _patched_mlp_forward(self, x):
+#     x = _qdq(x)                        # gate_up_proj activation QDQ
+#     gate_up, _ = self.gate_up_proj(x)
+#     out = self.act_fn(gate_up)         # SwiGLU stays FP
+#     out = _qdq(out)                    # down_proj activation QDQ
+#     out, _ = self.down_proj(out)
+#     return out
+# Qwen3NextMLP.forward = _patched_mlp_forward
 
 
 class AscendQwen3_5DecoderLayer(Qwen3_5DecoderLayer):
@@ -134,6 +168,7 @@ class AscendQwen3_5DecoderLayer(Qwen3_5DecoderLayer):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        # AMCT mlp: gate_up/down QDQ is inside self.mlp.forward (see _patched_mlp_forward above)
         hidden_states = self.mlp(hidden_states)
 
         if self.layer_scale:
@@ -194,6 +229,7 @@ if Qwen3_5MultiTokenPredictor is not None:
 
 Qwen3_5DecoderLayer.forward = AscendQwen3_5DecoderLayer.forward
 Qwen3NextAttention.forward = AscendQwen3NextAttention.forward
+# Qwen3NextMLP.forward = _patched_mlp_forward  # AMCT mlp activation QDQ
 _GDN_PATCH_TARGET._split_ba_for_tp = AscendGatedDeltaNetAttention._split_ba_for_tp
 _GDN_PATCH_TARGET.get_state_shape = AscendGatedDeltaNetAttention.get_state_shape
 _GDN_PATCH_TARGET.get_attn_backend = AscendGatedDeltaNetAttention.get_attn_backend

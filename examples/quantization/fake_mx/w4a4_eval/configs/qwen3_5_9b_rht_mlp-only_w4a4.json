@@ -1,0 +1,12 @@
+{
+  "default_quant_type": "W4A4_MXFP4_RHT_FAKE",
+  "group_size": 32,
+  "rht_matrix_size": 128,
+  "module_quant_overrides": {
+    "*embed_tokens*": "FLOAT",
+    "*lm_head": "FLOAT",
+    "*visual*": "FLOAT",
+    "*mlp*": "W4A4_MXFP4_RHT_FAKE",
+    "*": "FLOAT"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "default_quant_type": "W8A8_MXFP8_HADAMARD_LEARNING_FAKE",
+  "lht_params_path": "lht_params.safetensors",
+  "group_size": 32,
+  "hadamard_learning_matrix_size": 128,
+  "module_quant_overrides": {
+    "*self_attn.qkv_proj*": "W4A4_MXFP4_HADAMARD_LEARNING_FAKE",
+    "*self_attn.o_proj*": "W8A8_MXFP8_HADAMARD_LEARNING_FAKE",
+    "*linear_attn.in_proj*": "W4A4_MXFP4_HADAMARD_LEARNING_FAKE",
+    "*linear_attn.out_proj*": "W8A8_MXFP8_HADAMARD_LEARNING_FAKE",
+    "*": "FLOAT"
+  }
+}

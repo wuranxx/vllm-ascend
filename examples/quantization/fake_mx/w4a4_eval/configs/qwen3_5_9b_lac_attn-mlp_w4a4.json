@@ -1,0 +1,18 @@
+{
+  "default_quant_type": "W4A4_MXFP4_LAC_FAKE",
+  "lac_params_path": "lac_params.safetensors",
+  "group_size": 32,
+  "module_quant_overrides": {
+    "*embed_tokens*": "FLOAT",
+    "*lm_head": "FLOAT",
+    "*visual*": "FLOAT",
+    "*self_attn.qkv_proj*": "W4A4_MXFP4_LAC_FAKE",
+    "*self_attn.o_proj*": "W4A4_MXFP4_LAC_FAKE",
+    "*linear_attn.in_proj*": "W4A4_MXFP4_LAC_FAKE",
+    "*linear_attn.out_proj*": "W4A4_MXFP4_LAC_FAKE",
+    "*mlp.gate_proj*": "W4A4_MXFP4_LAC_FAKE",
+    "*mlp.up_proj*": "W4A4_MXFP4_LAC_FAKE",
+    "*mlp.down_proj*": "W4A4_MXFP4_LAC_FAKE",
+    "*": "FLOAT"
+  }
+}

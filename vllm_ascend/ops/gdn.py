@@ -37,6 +37,14 @@ from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
 
 
 class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
+    """GDN (Gated DeltaNet) linear attention for Ascend.
+
+    Patch-layer fake-MX insertion reference (DISABLED, see commented lines).
+    Aligns with AMCT attn-linear for GDN projections (in_proj_qkvz,
+    in_proj_ba, out_proj). Weight QDQ hooks into
+    patch_process_weights_after_loading.py (see patch_qwen3_5.py).
+    """
+
     def _split_ba_for_tp(self, ba: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if hasattr(self, "split_ba"):
             return self.split_ba(ba)
@@ -77,6 +85,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         """
         num_tokens = hidden_states.size(0)
         if hasattr(self, "in_proj_qkv"):
+            # --- AMCT attn-linear: in_proj_qkv/ba/z activation QDQ ---
+            # hidden_states = _qdq(hidden_states)
             mixed_qkv, _ = self.in_proj_qkv(hidden_states)
             ba, _ = self.in_proj_ba(hidden_states)
             z, _ = self.in_proj_z(hidden_states)
@@ -86,6 +96,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             a = a.contiguous()
         else:
             if not self.gqa_interleaved_layout:
+                # --- AMCT attn-linear: in_proj_qkvz/ba activation QDQ ---
+                # hidden_states = _qdq(hidden_states)
                 mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
                 num_tokens = mixed_qkvz.size(0)
                 qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
@@ -98,6 +110,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 b = b.contiguous()
                 a = a.contiguous()
             else:
+                # --- AMCT attn-linear: in_proj_qkvz/ba activation QDQ ---
+                # hidden_states = _qdq(hidden_states)
                 projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
                 projected_states_ba, _ = self.in_proj_ba(hidden_states)
                 num_tokens = projected_states_qkvz.size(0)
@@ -111,6 +125,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     self.head_v_dim,
                 )
 
+        # ============================================================
+        # Part 2: Core Attention (Custom Op) — stays FP, no QDQ
         # ============================================================
         # Part 2: Core Attention (Custom Op)
         # ============================================================
@@ -142,6 +158,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
+        # --- AMCT attn-linear: out_proj activation QDQ ---
+        # core_attn_out = _qdq(core_attn_out)
         output[:num_tokens], _ = self.out_proj(core_attn_out)
 
     def _forward_core(

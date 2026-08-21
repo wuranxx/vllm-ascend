@@ -1,0 +1,15 @@
+{
+  "default_quant_type": "W4A4_MXFP4_HADAMARD_LEARNING_FAKE",
+  "lht_params_path": "../Qwen3.5-9B-lht-mlp-params/lht_mlp_params.safetensors",
+  "group_size": 32,
+  "hadamard_learning_matrix_size": 128,
+  "module_quant_overrides": {
+    "*embed_tokens*": "FLOAT",
+    "*lm_head": "FLOAT",
+    "*visual*": "FLOAT",
+    "*mlp.gate_proj*": "W4A4_MXFP4_HADAMARD_LEARNING_FAKE",
+    "*mlp.up_proj*": "W4A4_MXFP4_HADAMARD_LEARNING_FAKE",
+    "*mlp.down_proj*": "W4A4_MXFP4_HADAMARD_LEARNING_FAKE",
+    "*": "FLOAT"
+  }
+}

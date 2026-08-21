@@ -51,6 +51,19 @@ def ascend_process_weights_after_loading(
     if model_config.quantization == "torchao":
         set_torchao_reload_attrs(model, model_config)
 
+    # --- Patch-layer fake-MX weight QDQ (DISABLED) ---
+    # This is the only correct hook point for weight QDQ: after all
+    # quant_method.process_weights_after_loading() calls complete and
+    # before the first forward pass.
+    #
+    # from vllm_ascend.quantization.fake_mx import fake_mx_quantize
+    # for name, module in model.named_modules():
+    #     if hasattr(module, 'weight') and hasattr(module.weight, 'data'):
+    #         if 'self_attn' in name or 'linear_attn' in name:   # AMCT attn-linear
+    #             module.weight.data.copy_(fake_mx_quantize(module.weight.data, "mxfp4", 32))
+    #         elif 'mlp' in name:                                 # AMCT mlp
+    #             module.weight.data.copy_(fake_mx_quantize(module.weight.data, "mxfp4", 32))
+
 
 utils.process_weights_after_loading = ascend_process_weights_after_loading
 base_loader.process_weights_after_loading = ascend_process_weights_after_loading

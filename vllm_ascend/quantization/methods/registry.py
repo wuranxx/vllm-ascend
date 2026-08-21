@@ -14,11 +14,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-
 from typing import Any
 
 # Registry: maps (quant_type, layer_type) -> SchemeClass
 _SCHEME_REGISTRY: dict[tuple[str, str], type[Any]] = {}
+
+# Reverse registry: maps SchemeClass -> (quant_type, layer_type)
+_REVERSE_REGISTRY: dict[type[Any], tuple[str, str]] = {}
 
 
 def register_scheme(quant_type: str, layer_type: str):
@@ -32,6 +34,7 @@ def register_scheme(quant_type: str, layer_type: str):
         Decorator function that registers the class.
 
     Example:
+
         @register_scheme("W8A8_DYNAMIC", "linear")
         class W8A8DynamicLinearScheme(AscendLinearScheme):
             ...
@@ -44,19 +47,24 @@ def register_scheme(quant_type: str, layer_type: str):
                 f"Scheme already registered for {quant_type}/{layer_type}: {_SCHEME_REGISTRY[key].__name__}"
             )
         _SCHEME_REGISTRY[key] = cls
+        _REVERSE_REGISTRY[cls] = key
         return cls
 
     return decorator
 
 
 def get_scheme_class(quant_type: str, layer_type: str) -> type[Any] | None:
-    """Get scheme class for given quant_type and layer_type.
-
-    Args:
-        quant_type: Quantization type (e.g., "W8A8", "W8A8_DYNAMIC").
-        layer_type: Layer type (e.g., "linear", "moe").
-
-    Returns:
-        The registered scheme class, or None if not found.
-    """
+    """Get scheme class for given quant_type and layer_type."""
     return _SCHEME_REGISTRY.get((quant_type, layer_type))
+
+
+def get_quant_type_for_scheme(cls: type[Any]) -> str | None:
+    """Reverse-lookup the quant_type string registered for *cls*.
+
+    Walks the MRO so subclasses inherit the parent's registration.
+    """
+    for klass in cls.__mro__:
+        entry = _REVERSE_REGISTRY.get(klass)
+        if entry is not None:
+            return entry[0]
+    return None

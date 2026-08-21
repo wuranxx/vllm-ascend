@@ -1,0 +1,14 @@
+{
+  "default_quant_type": "W4A4_MXFP4_LWC_FAKE",
+  "lwc_params_path": "lwc_params.safetensors",
+  "group_size": 32,
+  "module_quant_overrides": {
+    "*embed_tokens*": "FLOAT",
+    "*lm_head": "FLOAT",
+    "*visual*": "FLOAT",
+    "*mlp.gate_proj*": "W4A4_MXFP4_LWC_FAKE",
+    "*mlp.up_proj*": "W4A4_MXFP4_LWC_FAKE",
+    "*mlp.down_proj*": "W4A4_MXFP4_LWC_FAKE",
+    "*": "FLOAT"
+  }
+}

@@ -81,7 +81,7 @@ def _should_keep_nd_for_310p_weight(weight: torch.Tensor) -> bool:
 
 
 class AscendUnquantizedLinearMethod(UnquantizedLinearMethod):
-    """Linear method without quantization"""
+    """Linear method without quantization."""
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         super().process_weights_after_loading(layer)

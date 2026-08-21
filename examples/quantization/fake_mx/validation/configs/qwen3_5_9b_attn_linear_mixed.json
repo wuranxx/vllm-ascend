@@ -1,0 +1,11 @@
+{
+  "default_quant_type": "FLOAT",
+  "group_size": 32,
+  "module_quant_overrides": {
+    "*self_attn.qkv_proj*": "W4A4_MXFP4_FAKE",
+    "*self_attn.o_proj*": "W8A8_MXFP8_FAKE",
+    "*linear_attn.in_proj*": "W4A4_MXFP4_FAKE",
+    "*linear_attn.out_proj*": "W8A8_MXFP8_FAKE",
+    "*": "FLOAT"
+  }
+}

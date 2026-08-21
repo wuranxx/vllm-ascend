@@ -1,0 +1,12 @@
+{
+  "default_quant_type": "W4A4_MXFP4_FAKE",
+  "group_size": 32,
+  "module_quant_overrides": {
+    "*embed_tokens*": "FLOAT",
+    "*lm_head": "FLOAT",
+    "*visual*": "FLOAT",
+    "*self_attn*": "FLOAT",
+    "*linear_attn*": "FLOAT",
+    "*mlp*": "W4A4_MXFP4_FAKE"
+  }
+}

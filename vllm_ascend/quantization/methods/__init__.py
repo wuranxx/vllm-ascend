@@ -31,6 +31,30 @@ from typing import Any
 
 # Import base classes
 from .base import AscendAttentionScheme, AscendLinearScheme, AscendMoEScheme, QuantType
+from .fake_mx import (
+    AscendW4A4MXFP4AutoRoundFakeFusedMoEMethod,
+    AscendW4A4MXFP4AutoRoundFakeLinearMethod,
+    AscendW4A4MXFP4FakeFlatQuantLinearMethod,
+    AscendW4A4MXFP4FakeFusedMoEMethod,
+    AscendW4A4MXFP4FakeLinearMethod,
+    AscendW4A4MXFP4HadamardLearningFakeFusedMoEMethod,
+    AscendW4A4MXFP4HadamardLearningFakeLinearMethod,
+    AscendW4A4MXFP4OmniQuantFakeFusedMoEMethod,
+    AscendW4A4MXFP4OmniQuantFakeLinearMethod,
+    AscendW4A4MXFP4RHTFakeFusedMoEMethod,
+    AscendW4A4MXFP4RHTFakeLinearMethod,
+    AscendW8A8MXFP8AutoRoundFakeFusedMoEMethod,
+    AscendW8A8MXFP8AutoRoundFakeLinearMethod,
+    AscendW8A8MXFP8FakeFlatQuantLinearMethod,
+    AscendW8A8MXFP8FakeFusedMoEMethod,
+    AscendW8A8MXFP8FakeLinearMethod,
+    AscendW8A8MXFP8HadamardLearningFakeFusedMoEMethod,
+    AscendW8A8MXFP8HadamardLearningFakeLinearMethod,
+    AscendW8A8MXFP8OmniQuantFakeFusedMoEMethod,
+    AscendW8A8MXFP8OmniQuantFakeLinearMethod,
+    AscendW8A8MXFP8RHTFakeFusedMoEMethod,
+    AscendW8A8MXFP8RHTFakeLinearMethod,
+)
 
 # Import all scheme classes for external access
 from .fp8 import AscendW4A8MXFPDSDynamicFusedMoEMethod, AscendW8A8MXFP8DSDynamicLinearMethod
@@ -100,4 +124,26 @@ __all__ = [
     "AscendW4A4MXFP4FlatQuantDynamicLinearMethod",
     "AscendW8A8MXFP8DSDynamicLinearMethod",
     "AscendW4A8MXFPDSDynamicFusedMoEMethod",
+    "AscendW4A4MXFP4FakeLinearMethod",
+    "AscendW4A4MXFP4FakeFusedMoEMethod",
+    "AscendW8A8MXFP8FakeLinearMethod",
+    "AscendW8A8MXFP8FakeFusedMoEMethod",
+    "AscendW4A4MXFP4FakeFlatQuantLinearMethod",
+    "AscendW8A8MXFP8FakeFlatQuantLinearMethod",
+    "AscendW4A4MXFP4OmniQuantFakeLinearMethod",
+    "AscendW8A8MXFP8OmniQuantFakeLinearMethod",
+    "AscendW4A4MXFP4OmniQuantFakeFusedMoEMethod",
+    "AscendW8A8MXFP8OmniQuantFakeFusedMoEMethod",
+    "AscendW4A4MXFP4RHTFakeLinearMethod",
+    "AscendW8A8MXFP8RHTFakeLinearMethod",
+    "AscendW4A4MXFP4RHTFakeFusedMoEMethod",
+    "AscendW8A8MXFP8RHTFakeFusedMoEMethod",
+    "AscendW4A4MXFP4HadamardLearningFakeLinearMethod",
+    "AscendW8A8MXFP8HadamardLearningFakeLinearMethod",
+    "AscendW4A4MXFP4HadamardLearningFakeFusedMoEMethod",
+    "AscendW8A8MXFP8HadamardLearningFakeFusedMoEMethod",
+    "AscendW4A4MXFP4AutoRoundFakeLinearMethod",
+    "AscendW8A8MXFP8AutoRoundFakeLinearMethod",
+    "AscendW4A4MXFP4AutoRoundFakeFusedMoEMethod",
+    "AscendW8A8MXFP8AutoRoundFakeFusedMoEMethod",
 ]

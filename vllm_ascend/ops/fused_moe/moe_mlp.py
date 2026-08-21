@@ -28,6 +28,11 @@ from vllm_ascend.device.mxfp_compat import (
 )
 from vllm_ascend.ops.activation import AscendSwigluOAIAndMul, AscendSwigluStepAndMul
 from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEMlpComputeInput
+from vllm_ascend.quantization.fake_mx import (
+    fake_mx_quantize,
+    learned_hadamard_transform,
+    randomized_hadamard_transform,
+)
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import (
     dispose_tensor,
@@ -73,6 +78,52 @@ def cumsum_group_list(
         f"Conversion from src_list_type={src_list_type} to dst_list_type={dst_list_type} is not implemented yet. "
         "This feature is under development."
     )
+
+
+def _apply_expert_learned_hadamard(
+    hidden_states: torch.Tensor,
+    transform_weight: torch.Tensor,
+    group_list: torch.Tensor,
+    group_list_type: int,
+) -> torch.Tensor:
+    """Apply one learned block matrix to each expert's dispatched rows."""
+    if transform_weight.ndim != 3:
+        raise ValueError(
+            f"MoE Hadamard Learning transform must have shape [experts, K, K], got {tuple(transform_weight.shape)}."
+        )
+    if hidden_states.shape[0] == 0:
+        return hidden_states
+
+    boundaries = cumsum_group_list(
+        group_list,
+        group_list_type,
+        0,
+        active_num=hidden_states.shape[0],
+        expert_num=transform_weight.shape[0],
+    )
+    if boundaries.numel() != transform_weight.shape[0]:
+        raise ValueError(
+            "MoE Hadamard Learning group_list does not match local transforms: "
+            f"{boundaries.numel()} groups vs {transform_weight.shape[0]} matrices."
+        )
+
+    outputs: list[torch.Tensor] = []
+    start = 0
+    for expert_idx, end_tensor in enumerate(boundaries):
+        end = int(end_tensor.item())
+        if end < start or end > hidden_states.shape[0]:
+            raise ValueError("MoE Hadamard Learning received invalid expert token boundaries.")
+        if end > start:
+            outputs.append(
+                learned_hadamard_transform(
+                    hidden_states[start:end],
+                    transform_weight[expert_idx],
+                )
+            )
+        start = end
+    if start != hidden_states.shape[0]:
+        raise ValueError("MoE Hadamard Learning group_list does not cover all dispatched tokens.")
+    return torch.cat(outputs, dim=0) if outputs else hidden_states
 
 
 def _require_single_tensor_for_swiglu_quant(
@@ -376,10 +427,34 @@ def unquant_apply_mlp(
     lora_context=None,
     expanded_row_idx: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    fake_mx_format: str | None = None,
+    fake_mx_group_size: int = 32,
+    fake_mx_algorithm: str = "rtn",
+    fake_mx_rht_signs: torch.Tensor | None = None,
+    fake_mx_rht_group_size: int = 32,
+    fake_mx_w13_transform: torch.Tensor | None = None,
+    fake_mx_w2_transform: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if need_trans:
         w1 = w1.transpose(1, 2)
         w2 = w2.transpose(1, 2)
+
+    if fake_mx_algorithm == "hadamard_learning":
+        if fake_mx_w13_transform is None:
+            raise ValueError("fake-MX Hadamard Learning requires per-expert FC1 transforms.")
+        hidden_states = _apply_expert_learned_hadamard(
+            hidden_states,
+            fake_mx_w13_transform,
+            group_list,
+            group_list_type,
+        )
+        if fake_mx_format is None:
+            raise ValueError("fake-MX Hadamard Learning requires a fake MX format.")
+        hidden_states = fake_mx_quantize(
+            hidden_states,
+            fake_mx_format,
+            fake_mx_group_size,
+        )
 
     gate_up_out = torch_npu.npu_grouped_matmul(
         x=[hidden_states],
@@ -432,6 +507,31 @@ def unquant_apply_mlp(
             gate.clamp_(max=swiglu_limit)
             up.clamp_(min=-swiglu_limit, max=swiglu_limit)
         gate_up_out = torch_npu.npu_swiglu(gate_up_out)
+
+    if fake_mx_algorithm == "rht":
+        if fake_mx_rht_signs is None:
+            raise ValueError("fake-MX RHT requires signs for the MoE down projection.")
+        gate_up_out = randomized_hadamard_transform(
+            gate_up_out,
+            fake_mx_rht_signs,
+            fake_mx_rht_group_size,
+        )
+    elif fake_mx_algorithm == "hadamard_learning":
+        if fake_mx_w2_transform is None:
+            raise ValueError("fake-MX Hadamard Learning requires per-expert FC2 transforms.")
+        gate_up_out = _apply_expert_learned_hadamard(
+            gate_up_out,
+            fake_mx_w2_transform,
+            group_list,
+            group_list_type,
+        )
+
+    if fake_mx_format is not None:
+        gate_up_out = fake_mx_quantize(
+            gate_up_out,
+            fake_mx_format,
+            fake_mx_group_size,
+        )
 
     if topk_scales is not None:
         gate_up_out *= topk_scales
@@ -500,6 +600,13 @@ def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
             lora_context=mlp_compute_input.lora_context,
             expanded_row_idx=mlp_compute_input.expanded_row_idx,
             topk_ids=mlp_compute_input.topk_ids,
+            fake_mx_format=mlp_compute_input.quant.fake_mx_format,
+            fake_mx_group_size=mlp_compute_input.quant.fake_mx_group_size,
+            fake_mx_algorithm=mlp_compute_input.quant.fake_mx_algorithm,
+            fake_mx_rht_signs=mlp_compute_input.quant.fake_mx_rht_signs,
+            fake_mx_rht_group_size=mlp_compute_input.quant.fake_mx_rht_group_size,
+            fake_mx_w13_transform=mlp_compute_input.quant.fake_mx_w13_transform,
+            fake_mx_w2_transform=mlp_compute_input.quant.fake_mx_w2_transform,
         )
 
     assert w1_scale is not None and w2_scale is not None

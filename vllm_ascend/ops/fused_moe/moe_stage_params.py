@@ -63,6 +63,13 @@ class MoEQuantParams:
     comm_quant_mode: int | None = None
     mxfp: MoEMxfpParams | None = None
     is_per_channel_weight: bool = False
+    fake_mx_format: str | None = None
+    fake_mx_group_size: int = 32
+    fake_mx_algorithm: str = "rtn"
+    fake_mx_rht_signs: torch.Tensor | None = None
+    fake_mx_rht_group_size: int = 32
+    fake_mx_w13_transform: torch.Tensor | None = None
+    fake_mx_w2_transform: torch.Tensor | None = None
 
     @property
     def is_quant(self) -> bool:
