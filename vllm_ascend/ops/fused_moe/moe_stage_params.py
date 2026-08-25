@@ -70,6 +70,11 @@ class MoEQuantParams:
     fake_mx_rht_group_size: int = 32
     fake_mx_w13_transform: torch.Tensor | None = None
     fake_mx_w2_transform: torch.Tensor | None = None
+    # FlatQuant per-expert state for MoE FlatQuant fake scheme.
+    # Each dict maps component names ("left_trans", "right_trans", "diag_scale")
+    # to per-expert tensors shaped [num_local_experts, ...].
+    fake_mx_flatquant_fc1_state: dict[str, torch.Tensor] | None = None
+    fake_mx_flatquant_fc2_state: dict[str, torch.Tensor] | None = None
 
     @property
     def is_quant(self) -> bool:

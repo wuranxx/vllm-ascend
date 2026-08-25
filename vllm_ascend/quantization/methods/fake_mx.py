@@ -1098,3 +1098,313 @@ class AscendW8A8MXFP8HadamardLearningFakeFusedMoEMethod(_AscendFakeMXFusedMoEMet
     mx_format: FakeMXFormat = "mxfp8"
     algorithm = "hadamard_learning"
     required_weight_state = "hadamard_learning_transformed_fp"
+
+
+def _build_flatquant_sidecar_key(
+    layer_prefix: str, expert_idx: int, fc_name: str, comp: str
+) -> str:
+    """Build sidecar tensor key for a per-expert FlatQuant state.
+
+    Format: layers.{N}.experts.{E}.{fc}.{comp_short}
+    Example: layers.0.experts.17.fc1.left_trans
+    """
+    parts = layer_prefix.split(".")
+    layer_idx = None
+    for i, p in enumerate(parts):
+        if p == "layers" and i + 1 < len(parts):
+            layer_idx = parts[i + 1]
+            break
+    if layer_idx is None:
+        return f"{layer_prefix}.{fc_name}.{comp}"
+
+    comp_short = "diag" if comp == "diag_scale" else comp
+    return f"layers.{layer_idx}.experts.{expert_idx}.{fc_name}.{comp_short}"
+
+
+class _AscendFakeMXFlatQuantFusedMoEMethod(_AscendFakeMXFusedMoEMethod):
+    """FlatQuant transform + fake MX QDQ for routed MoE experts.
+
+    Each routed expert has independent FC1 and FC2 FlatQuant state
+    (left_trans, right_trans, diag_scale).  At load time the weight is
+    inverse-transformed and QDQ'd per expert; at forward time the
+    activation is forward-transformed and QDQ'd per expert segment.
+
+    Shared expert is NOT handled here — it uses the Linear direct W4A4
+    scheme via ``module_quant_overrides``.
+    """
+
+    algorithm = "flatquant"
+
+    def __init__(self):
+        super().__init__()
+        quant_description = _quant_description()
+        self.flatquant_params_path = quant_description.get("flatquant_params_path")
+        if not self.flatquant_params_path:
+            raise ValueError("MoE FlatQuant requires flatquant_params_path.")
+        self.matrix_size = int(
+            quant_description.get("flatquant_matrix_size", DEFAULT_TRANSFORM_MATRIX_SIZE)
+        )
+        self.use_diag_scale = bool(quant_description.get("flatquant_use_diag", True))
+
+    def _decompose_dim(self, dim: int) -> tuple[int, int]:
+        """Decompose a feature dimension into FlatQuant Kronecker dims.
+
+        Prefer ``matrix_size`` as right_dim when divisible, matching the
+        Dense FlatQuant path.  Fall back to ``_get_decompose_dim`` otherwise.
+        """
+        if dim % self.matrix_size == 0:
+            return dim // self.matrix_size, self.matrix_size
+        return _get_decompose_dim(dim, 1)
+
+    def get_weight(
+        self,
+        num_experts: int,
+        intermediate_size_per_partition: int,
+        hidden_sizes: int,
+        params_dtype: torch.dtype,
+    ) -> dict[str, Any]:
+        weights = super().get_weight(
+            num_experts, intermediate_size_per_partition, hidden_sizes, params_dtype
+        )
+        # FC1 K = hidden_sizes, FC2 K = intermediate_size_per_partition.
+        # AMCT Kronecker decomposition: left_dim * right_dim = K.
+        # Prefer matrix_size as right_dim when K is divisible (matches Dense path).
+        fc1_left_dim, fc1_right_dim = self._decompose_dim(hidden_sizes)
+        fc2_left_dim, fc2_right_dim = self._decompose_dim(intermediate_size_per_partition)
+        weights.update({
+            "fc1_left_trans": torch.eye(fc1_left_dim, dtype=torch.float32).unsqueeze(0).repeat(num_experts, 1, 1),
+            "fc1_right_trans": torch.eye(fc1_right_dim, dtype=torch.float32).unsqueeze(0).repeat(num_experts, 1, 1),
+            "fc1_diag_scale": torch.ones(num_experts, hidden_sizes, dtype=torch.float32),
+            "fc2_left_trans": torch.eye(fc2_left_dim, dtype=torch.float32).unsqueeze(0).repeat(num_experts, 1, 1),
+            "fc2_right_trans": torch.eye(fc2_right_dim, dtype=torch.float32).unsqueeze(0).repeat(num_experts, 1, 1),
+            "fc2_diag_scale": torch.ones(num_experts, intermediate_size_per_partition, dtype=torch.float32),
+        })
+        return weights
+
+    def _load_per_expert_state(
+        self, layer: torch.nn.Module, ext_params: dict[str, torch.Tensor], fc_name: str,
+        expert_map: torch.Tensor | None,
+    ) -> None:
+        """Load FlatQuant state from sidecar into layer parameters.
+
+        ``expert_map`` maps logical expert ID to local physical slot
+        (``expert_map[logical_id] = physical_slot`` or ``-1`` if not on this
+        rank).  When ``expert_map`` is None (EP=1), physical slot equals
+        logical ID and no reverse lookup is needed.
+        """
+        layer_prefix = getattr(layer, "prefix", "") or ""
+        num_experts = getattr(layer, "fc1_left_trans").shape[0]
+
+        # Build physical_slot -> logical_expert_id reverse mapping.
+        if expert_map is not None:
+            phy_to_logical: dict[int, int] = {}
+            for logical_id in range(expert_map.numel()):
+                slot = int(expert_map[logical_id].item())
+                if slot != -1:
+                    phy_to_logical[slot] = logical_id
+        else:
+            phy_to_logical = None
+
+        for comp in ["left_trans", "right_trans", "diag_scale"]:
+            param = getattr(layer, f"{fc_name}_{comp}")
+            for slot in range(num_experts):
+                logical_e = slot if phy_to_logical is None else phy_to_logical.get(slot, slot)
+                key = _build_flatquant_sidecar_key(layer_prefix, logical_e, fc_name, comp)
+                if key in ext_params:
+                    param.data[slot].copy_(
+                        ext_params[key].to(device=param.device, dtype=param.dtype)
+                    )
+                else:
+                    logger.warning_once(
+                        "FlatQuant sidecar missing key %s; using identity.", key
+                    )
+
+    def _inverse_transform_and_qdq_weight(
+        self,
+        weight: torch.Tensor,
+        left_trans: torch.Tensor,
+        right_trans: torch.Tensor,
+        diag_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply FlatQuant inverse weight transform, then MXFP4 QDQ."""
+        left_dim = left_trans.shape[0]
+        right_dim = right_trans.shape[0]
+        transformed = transform_flatquant_weight(
+            weight, left_trans, right_trans, diag_scale, left_dim, right_dim
+        )
+        return fake_mx_quantize(transformed.to(weight.dtype), self.mx_format, self.group_size)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if getattr(layer, "_fake_mx_flatquant_processed", False):
+            return
+
+        ext_params = _load_transform_params(self.flatquant_params_path)
+
+        # Obtain expert_map for physical-to-logical reverse lookup.
+        expert_map = getattr(layer, "_expert_map", None)
+
+        # Load FlatQuant state from sidecar into layer parameters.
+        self._load_per_expert_state(layer, ext_params, "fc1", expert_map)
+        self._load_per_expert_state(layer, ext_params, "fc2", expert_map)
+
+        # Per-expert inverse weight transform + QDQ.
+        num_experts = layer.w13_weight.shape[0]
+        for e in range(num_experts):
+            # FC1: w13[e] shape [2*I, H], K=H
+            layer.w13_weight.data[e] = self._inverse_transform_and_qdq_weight(
+                layer.w13_weight.data[e],
+                layer.fc1_left_trans.data[e],
+                layer.fc1_right_trans.data[e],
+                layer.fc1_diag_scale.data[e],
+            )
+            # FC2: w2[e] shape [H, I], K=I
+            layer.w2_weight.data[e] = self._inverse_transform_and_qdq_weight(
+                layer.w2_weight.data[e],
+                layer.fc2_left_trans.data[e],
+                layer.fc2_right_trans.data[e],
+                layer.fc2_diag_scale.data[e],
+            )
+
+        # Convert to GMM layout [E, K, N] (same as parent).
+        w13_data = layer.w13_weight.data.transpose(1, 2).contiguous()
+        w2_data = layer.w2_weight.data.transpose(1, 2).contiguous()
+        layer.w13_weight = torch.nn.Parameter(maybe_trans_nz(w13_data), requires_grad=False)
+        layer.w2_weight = torch.nn.Parameter(maybe_trans_nz(w2_data), requires_grad=False)
+
+        # Freeze FlatQuant state as Parameters.
+        for param_name in [
+            "fc1_left_trans", "fc1_right_trans", "fc1_diag_scale",
+            "fc2_left_trans", "fc2_right_trans", "fc2_diag_scale",
+        ]:
+            param = getattr(layer, param_name)
+            setattr(layer, param_name, torch.nn.Parameter(param.data.contiguous(), requires_grad=False))
+
+        layer._fake_mx_flatquant_processed = True
+        layer._fake_mx_weight_processed = True
+
+    def _pack_fc_state(self, layer: torch.nn.Module, fc_name: str) -> dict[str, torch.Tensor]:
+        """Pack per-expert FlatQuant state for one FC into a dict for runtime."""
+        state = {
+            "left_trans": getattr(layer, f"{fc_name}_left_trans"),
+            "right_trans": getattr(layer, f"{fc_name}_right_trans"),
+        }
+        if self.use_diag_scale:
+            state["diag_scale"] = getattr(layer, f"{fc_name}_diag_scale")
+        return state
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        use_grouped_topk: bool = False,
+        num_experts: int = -1,
+        expert_map: torch.Tensor | None = None,
+        topk_group: int | None = None,
+        num_expert_group: int | None = None,
+        custom_routing_function: Callable | None = None,
+        scoring_func: str = "softmax",
+        routed_scaling_factor: float = 1.0,
+        e_score_correction_bias: torch.Tensor | None = None,
+        is_prefill: bool = True,
+        enable_force_load_balance: bool = False,
+        log2phy: torch.Tensor | None = None,
+        global_redundant_expert_num: int = 0,
+        pertoken_scale: Any | None = None,
+        activation: str = "silu",
+        apply_router_weight_on_input: bool = False,
+        mc2_mask: torch.Tensor | None = None,
+        tid2eid: Any | None = None,
+    ) -> torch.Tensor:
+        self._validate_execution_path()
+        num_shared_experts = getattr(layer, "n_shared_experts", 0) or 0
+        num_logical_experts = get_moe_num_logical_experts(
+            layer,
+            num_experts,
+            global_redundant_expert_num=global_redundant_expert_num,
+            num_shared_experts=num_shared_experts,
+        )
+        if router_logits.shape[1] != num_logical_experts:
+            raise AssertionError("Number of global experts mismatch (excluding redundancy)")
+
+        # Router sees ORIGINAL BF16 x — no transform, no QDQ.
+        topk_weights, topk_ids = select_experts(
+            hidden_states=x,
+            router_logits=router_logits,
+            top_k=top_k,
+            use_grouped_topk=use_grouped_topk,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            custom_routing_function=custom_routing_function,
+            scoring_func=scoring_func,
+            routed_scaling_factor=routed_scaling_factor,
+            e_score_correction_bias=e_score_correction_bias,
+            num_experts=num_logical_experts,
+            tid2eid=tid2eid,
+        )
+        if topk_weights is None or topk_ids is None:
+            raise RuntimeError("topk_weights and topk_ids must be set before fused MoE execution.")
+        if enable_force_load_balance:
+            random_matrix = torch.rand(topk_ids.size(0), num_logical_experts, device=topk_ids.device)
+            topk_ids = torch.argsort(random_matrix, dim=1)[:, : topk_ids.size(1)].to(topk_ids.dtype)
+
+        topk_weights = topk_weights.to(x.dtype)
+        # FC1 activation transform + QDQ happens in moe_mlp.py per-expert segment.
+        # Pass ORIGINAL x and FlatQuant state via build_fused_experts_input.
+        moe_comm_method = _EXTRA_CTX.moe_comm_method
+        if moe_comm_method is None:
+            raise RuntimeError("Missing MoE communication context.")
+        w13_weight_list = getattr(layer, "w13_weight_list", None)
+        w2_weight_list = getattr(layer, "w2_weight_list", None)
+        w1 = w13_weight_list if isinstance(w13_weight_list, list) else layer.w13_weight
+        w2 = w2_weight_list if isinstance(w2_weight_list, list) else layer.w2_weight
+        has_bias = bool(getattr(getattr(layer, "moe", None), "has_bias", False))
+        return moe_comm_method.fused_experts(
+            fused_experts_input=build_fused_experts_input(
+                hidden_states=x,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                w1=w1,
+                w2=w2,
+                quant_type=QuantType.NONE,
+                dynamic_eplb=self.dynamic_eplb,
+                expert_map=expert_map,
+                global_redundant_expert_num=global_redundant_expert_num,
+                mc2_mask=mc2_mask,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                log2phy=log2phy,
+                pertoken_scale=pertoken_scale,
+                activation=activation,
+                fake_mx_format=self.mx_format,
+                fake_mx_group_size=self.group_size,
+                fake_mx_algorithm="flatquant",
+                fake_mx_rht_signs=None,
+                fake_mx_rht_group_size=self.rht_matrix_size,
+                fake_mx_w13_transform=None,
+                fake_mx_w2_transform=None,
+                fake_mx_flatquant_fc1_state=self._pack_fc_state(layer, "fc1"),
+                fake_mx_flatquant_fc2_state=self._pack_fc_state(layer, "fc2"),
+                w1_bias=layer.w13_bias if has_bias else None,
+                w2_bias=layer.w2_bias if has_bias else None,
+                w1_scale=None,
+                w2_scale=None,
+                w1_scale_bias=None,
+                w2_scale_bias=None,
+                swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
+                lora_context=getattr(layer, "_ascend_moe_lora_context", None),
+            )
+        )
+
+
+@register_scheme("W4A4_MXFP4_FLATQUANT_FAKE", "moe")
+class AscendW4A4MXFP4FakeFlatQuantFusedMoEMethod(_AscendFakeMXFlatQuantFusedMoEMethod):
+    """W4A4 MXFP4 FlatQuant fake-QDQ for FusedMoE (routed experts only)."""
+    mx_format: FakeMXFormat = "mxfp4"
+
+
+@register_scheme("W8A8_MXFP8_FLATQUANT_FAKE", "moe")
+class AscendW8A8MXFP8FakeFlatQuantFusedMoEMethod(_AscendFakeMXFlatQuantFusedMoEMethod):
+    mx_format: FakeMXFormat = "mxfp8"

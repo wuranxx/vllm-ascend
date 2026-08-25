@@ -33,6 +33,7 @@ from vllm_ascend.quantization.fake_mx import (
     learned_hadamard_transform,
     randomized_hadamard_transform,
 )
+from vllm_ascend.quantization.methods.fake_mx import transform_flatquant_activation
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import (
     dispose_tensor,
@@ -123,6 +124,75 @@ def _apply_expert_learned_hadamard(
         start = end
     if start != hidden_states.shape[0]:
         raise ValueError("MoE Hadamard Learning group_list does not cover all dispatched tokens.")
+    return torch.cat(outputs, dim=0) if outputs else hidden_states
+
+
+def _apply_expert_flatquant(
+    hidden_states: torch.Tensor,
+    fc_state: dict[str, torch.Tensor],
+    group_list: torch.Tensor,
+    group_list_type: int,
+) -> torch.Tensor:
+    """Apply per-expert FlatQuant activation transform.
+
+    Dispatched tokens are arranged by local physical expert. group_list
+    describes token boundaries per expert. We split by expert, apply the
+    FlatQuant forward transform (x' = L.T @ (reshape(x) * diag) @ R) using
+    that expert's L/R/diag, then concatenate back.
+
+    This mirrors ``_apply_expert_learned_hadamard`` but uses the Kronecker
+    decomposition (left/right/diag) instead of a single K×K matrix.
+
+    Note: ``end_tensor.item()`` in the per-expert loop triggers a device-to-host
+    sync.  This is acceptable for the first version (correctness validation),
+    matching the pattern in ``_apply_expert_learned_hadamard``.  Batched
+    device-side implementation should replace this once the math is validated.
+    """
+    left_trans = fc_state["left_trans"]      # [E, L, L]
+    right_trans = fc_state["right_trans"]    # [E, R, R]
+    diag_scale = fc_state.get("diag_scale")  # [E, K] or None
+
+    num_experts = left_trans.shape[0]
+    if hidden_states.shape[0] == 0:
+        return hidden_states
+
+    boundaries = cumsum_group_list(
+        group_list, group_list_type, 0,
+        active_num=hidden_states.shape[0],
+        expert_num=num_experts,
+    )
+    if boundaries.numel() != num_experts:
+        raise ValueError(
+            "MoE FlatQuant group_list does not match local transforms: "
+            f"{boundaries.numel()} groups vs {num_experts} matrices."
+        )
+
+    outputs: list[torch.Tensor] = []
+    start = 0
+    for expert_idx, end_tensor in enumerate(boundaries):
+        end = int(end_tensor.item())
+        if end < start or end > hidden_states.shape[0]:
+            raise ValueError("MoE FlatQuant received invalid expert token boundaries.")
+        if end > start:
+            seg = hidden_states[start:end]
+            L = left_trans[expert_idx]       # [L_dim, L_dim]
+            R = right_trans[expert_idx]      # [R_dim, R_dim]
+            left_dim = L.shape[0]
+            right_dim = R.shape[0]
+            input_dim = seg.shape[-1]
+            if left_dim * right_dim != input_dim:
+                raise ValueError(
+                    f"FlatQuant transform dimension mismatch: left({left_dim}) * right({right_dim}) "
+                    f"!= input({input_dim}) for expert {expert_idx}."
+                )
+            diag = diag_scale[expert_idx] if diag_scale is not None else None
+            transformed = transform_flatquant_activation(
+                seg, L, R, diag, left_dim, right_dim
+            )
+            outputs.append(transformed)
+        start = end
+    if start != hidden_states.shape[0]:
+        raise ValueError("MoE FlatQuant group_list does not cover all dispatched tokens.")
     return torch.cat(outputs, dim=0) if outputs else hidden_states
 
 
@@ -434,6 +504,8 @@ def unquant_apply_mlp(
     fake_mx_rht_group_size: int = 32,
     fake_mx_w13_transform: torch.Tensor | None = None,
     fake_mx_w2_transform: torch.Tensor | None = None,
+    fake_mx_flatquant_fc1_state: dict[str, torch.Tensor] | None = None,
+    fake_mx_flatquant_fc2_state: dict[str, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     if need_trans:
         w1 = w1.transpose(1, 2)
@@ -450,6 +522,22 @@ def unquant_apply_mlp(
         )
         if fake_mx_format is None:
             raise ValueError("fake-MX Hadamard Learning requires a fake MX format.")
+        hidden_states = fake_mx_quantize(
+            hidden_states,
+            fake_mx_format,
+            fake_mx_group_size,
+        )
+    elif fake_mx_algorithm == "flatquant":
+        if fake_mx_flatquant_fc1_state is None:
+            raise ValueError("fake-MX FlatQuant requires per-expert FC1 state.")
+        if fake_mx_format is None:
+            raise ValueError("fake-MX FlatQuant requires a fake MX format.")
+        hidden_states = _apply_expert_flatquant(
+            hidden_states,
+            fake_mx_flatquant_fc1_state,
+            group_list,
+            group_list_type,
+        )
         hidden_states = fake_mx_quantize(
             hidden_states,
             fake_mx_format,
@@ -522,6 +610,15 @@ def unquant_apply_mlp(
         gate_up_out = _apply_expert_learned_hadamard(
             gate_up_out,
             fake_mx_w2_transform,
+            group_list,
+            group_list_type,
+        )
+    elif fake_mx_algorithm == "flatquant":
+        if fake_mx_flatquant_fc2_state is None:
+            raise ValueError("fake-MX FlatQuant requires per-expert FC2 state.")
+        gate_up_out = _apply_expert_flatquant(
+            gate_up_out,
+            fake_mx_flatquant_fc2_state,
             group_list,
             group_list_type,
         )
@@ -607,6 +704,8 @@ def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
             fake_mx_rht_group_size=mlp_compute_input.quant.fake_mx_rht_group_size,
             fake_mx_w13_transform=mlp_compute_input.quant.fake_mx_w13_transform,
             fake_mx_w2_transform=mlp_compute_input.quant.fake_mx_w2_transform,
+            fake_mx_flatquant_fc1_state=mlp_compute_input.quant.fake_mx_flatquant_fc1_state,
+            fake_mx_flatquant_fc2_state=mlp_compute_input.quant.fake_mx_flatquant_fc2_state,
         )
 
     assert w1_scale is not None and w2_scale is not None
