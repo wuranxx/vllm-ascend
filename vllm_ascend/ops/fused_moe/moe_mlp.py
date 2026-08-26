@@ -30,8 +30,8 @@ from vllm_ascend.ops.activation import AscendSwigluOAIAndMul, AscendSwigluStepAn
 from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEMlpComputeInput
 from vllm_ascend.quantization.fake_mx import (
     fake_mx_quantize,
+    hadamard_transform,
     learned_hadamard_transform,
-    randomized_hadamard_transform,
 )
 from vllm_ascend.quantization.methods.fake_mx import transform_flatquant_activation
 from vllm_ascend.quantization.quant_type import QuantType
@@ -597,13 +597,7 @@ def unquant_apply_mlp(
         gate_up_out = torch_npu.npu_swiglu(gate_up_out)
 
     if fake_mx_algorithm == "rht":
-        if fake_mx_rht_signs is None:
-            raise ValueError("fake-MX RHT requires signs for the MoE down projection.")
-        gate_up_out = randomized_hadamard_transform(
-            gate_up_out,
-            fake_mx_rht_signs,
-            fake_mx_rht_group_size,
-        )
+        gate_up_out = hadamard_transform(gate_up_out, fake_mx_rht_group_size)
     elif fake_mx_algorithm == "hadamard_learning":
         if fake_mx_w2_transform is None:
             raise ValueError("fake-MX Hadamard Learning requires per-expert FC2 transforms.")

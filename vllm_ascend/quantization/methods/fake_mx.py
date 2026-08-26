@@ -32,7 +32,6 @@ from vllm_ascend.quantization.fake_mx import (
     fake_mx_quantize,
     hadamard_transform,
     learned_hadamard_transform,
-    randomized_hadamard_transform,
 )
 from vllm_ascend.utils import maybe_trans_nz
 
@@ -197,15 +196,17 @@ def transform_lht_weight(
     transform_weight: torch.Tensor,
     matrix_size: int,
 ) -> torch.Tensor:
-    """LHT weight inverse transform: W' = W @ Q (block-wise).
+    """LHT weight inverse transform: W' = W @ inv(T).T (block-wise).
 
-    AMCT exports the orthogonal matrix Q actually used by forward.  Since
-    inv(Q).T == Q for orthogonal matrices, the paired weight transform is
-    also W @ Q — no explicit inverse needed.
+    The learned transform matrix T is invertible but not necessarily
+    orthogonal, so inv(T).T != T in general.  The activation forward
+    transform is x' = x @ T; the paired weight transform must be
+    W' = W @ inv(T).T so that x' @ W'.T == x @ W.T.
     """
     original_shape = weight.shape
     weight_blocked = weight.to(torch.float32).reshape(-1, matrix_size)
-    rotated = weight_blocked @ transform_weight.to(torch.float32)
+    inv_t_t = _inverse_fp32(transform_weight, transpose=True)
+    rotated = weight_blocked @ inv_t_t
     return rotated.reshape(original_shape)
 
 
@@ -821,6 +822,7 @@ class _AscendFakeMXFusedMoEMethod(AscendMoEScheme):
         self.hadamard_learning_matrix_size = int(
             quant_description.get("hadamard_learning_matrix_size", DEFAULT_TRANSFORM_MATRIX_SIZE)
         )
+        self.params_path = quant_description.get("lht_params_path") if self.algorithm == "hadamard_learning" else None
         _validate_weight_state(self.algorithm, self.required_weight_state, quant_description)
         self.dynamic_eplb = get_ascend_config().eplb_config.dynamic_eplb
         if self.dynamic_eplb:
@@ -849,20 +851,11 @@ class _AscendFakeMXFusedMoEMethod(AscendMoEScheme):
         }
         if self.algorithm == "hadamard_learning":
             matrix_size = self.hadamard_learning_matrix_size
+            eye = torch.eye(matrix_size, dtype=params_dtype)
             weights.update(
                 {
-                    "w13_transform_weight": torch.empty(
-                        num_experts,
-                        matrix_size,
-                        matrix_size,
-                        dtype=params_dtype,
-                    ),
-                    "w2_transform_weight": torch.empty(
-                        num_experts,
-                        matrix_size,
-                        matrix_size,
-                        dtype=params_dtype,
-                    ),
+                    "w13_transform_weight": eye.unsqueeze(0).expand(num_experts, -1, -1).contiguous(),
+                    "w2_transform_weight": eye.unsqueeze(0).expand(num_experts, -1, -1).contiguous(),
                 }
             )
         return weights
@@ -880,13 +873,37 @@ class _AscendFakeMXFusedMoEMethod(AscendMoEScheme):
         if getattr(layer, "_fake_mx_weight_processed", False):
             return
         if self.algorithm == "rht":
-            pass
+            if not getattr(layer, "_fake_mx_rht_weight_rotated", False):
+                layer.w13_weight.data.copy_(
+                    hadamard_transform(layer.w13_weight.data, self.rht_matrix_size)
+                )
+                layer.w2_weight.data.copy_(
+                    hadamard_transform(layer.w2_weight.data, self.rht_matrix_size)
+                )
+                layer._fake_mx_rht_weight_rotated = True
         elif self.algorithm == "hadamard_learning":
             matrix_size = self.hadamard_learning_matrix_size
             if layer.w13_weight.shape[-1] % matrix_size or layer.w2_weight.shape[-1] % matrix_size:
                 raise ValueError(
                     f"Hadamard Learning MoE input dimensions must be divisible by matrix_size ({matrix_size})."
                 )
+            if not getattr(layer, "_fake_mx_lht_weight_transformed", False):
+                for expert_idx in range(layer.w13_weight.shape[0]):
+                    layer.w13_weight.data[expert_idx].copy_(
+                        transform_lht_weight(
+                            layer.w13_weight.data[expert_idx],
+                            layer.w13_transform_weight.data[expert_idx],
+                            matrix_size,
+                        ).to(layer.w13_weight.data.dtype)
+                    )
+                    layer.w2_weight.data[expert_idx].copy_(
+                        transform_lht_weight(
+                            layer.w2_weight.data[expert_idx],
+                            layer.w2_transform_weight.data[expert_idx],
+                            matrix_size,
+                        ).to(layer.w2_weight.data.dtype)
+                    )
+                layer._fake_mx_lht_weight_transformed = True
             layer.w13_transform_weight = torch.nn.Parameter(
                 layer.w13_transform_weight.data.contiguous(), requires_grad=False
             )
@@ -1066,38 +1083,32 @@ class AscendW8A8MXFP8AutoRoundFakeFusedMoEMethod(_AscendFakeMXFusedMoEMethod):
 
 @register_scheme("W4A4_MXFP4_RHT_FAKE", "moe")
 class AscendW4A4MXFP4RHTFakeFusedMoEMethod(_AscendFakeMXFusedMoEMethod):
-    """RHT for MoE: requires pre-rotated checkpoint (rht_rotated_fp).
-    Unlike Linear RHT, MoE does not rotate weights at load time because
-    per-expert rotation must align with the dispatch/GMM execution path."""
+    """RHT for MoE: rotates weights at load time using deterministic Hadamard
+    (same as Linear RHT). No pre-rotated checkpoint required."""
 
     mx_format: FakeMXFormat = "mxfp4"
     algorithm = "rht"
-    required_weight_state = "rht_rotated_fp"
 
 
 @register_scheme("W8A8_MXFP8_RHT_FAKE", "moe")
 class AscendW8A8MXFP8RHTFakeFusedMoEMethod(_AscendFakeMXFusedMoEMethod):
     mx_format: FakeMXFormat = "mxfp8"
     algorithm = "rht"
-    required_weight_state = "rht_rotated_fp"
 
 
 @register_scheme("W4A4_MXFP4_HADAMARD_LEARNING_FAKE", "moe")
 class AscendW4A4MXFP4HadamardLearningFakeFusedMoEMethod(_AscendFakeMXFusedMoEMethod):
-    """LHT for MoE: requires pre-transformed checkpoint (hadamard_learning_transformed_fp).
-    Unlike Linear LHT, MoE does not apply inverse transform at load time
-    because per-expert transform matrices are selected after token dispatch."""
+    """LHT for MoE: loads per-expert transform matrices and applies inverse
+    transform (W @ inv(T).T) at load time, same as Linear LHT."""
 
     mx_format: FakeMXFormat = "mxfp4"
     algorithm = "hadamard_learning"
-    required_weight_state = "hadamard_learning_transformed_fp"
 
 
 @register_scheme("W8A8_MXFP8_HADAMARD_LEARNING_FAKE", "moe")
 class AscendW8A8MXFP8HadamardLearningFakeFusedMoEMethod(_AscendFakeMXFusedMoEMethod):
     mx_format: FakeMXFormat = "mxfp8"
     algorithm = "hadamard_learning"
-    required_weight_state = "hadamard_learning_transformed_fp"
 
 
 def _build_flatquant_sidecar_key(
