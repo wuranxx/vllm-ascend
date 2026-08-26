@@ -1,0 +1,22 @@
+{
+  "default_quant_type": "FLOAT",
+  "group_size": 32,
+  "fake_mx_backend": "reference",
+  "flatquant_params_path": "flatquant_moe_state.safetensors",
+  "flatquant_matrix_size": 128,
+  "flatquant_use_diag": true,
+  "module_quant_overrides": {
+    "*embed_tokens*": "FLOAT",
+    "*lm_head*": "FLOAT",
+    "*visual*": "FLOAT",
+    "*shared_expert_gate*": "FLOAT",
+    "*mlp.gate*": "FLOAT",
+    "*self_attn*": "FLOAT",
+    "*linear_attn*": "FLOAT",
+    "*shared_expert.gate_proj*": "W4A4_MXFP4_FAKE",
+    "*shared_expert.up_proj*": "W4A4_MXFP4_FAKE",
+    "*shared_expert.down_proj*": "W4A4_MXFP4_FAKE",
+    "*mlp.experts*": "W4A4_MXFP4_FLATQUANT_FAKE",
+    "*": "FLOAT"
+  }
+}

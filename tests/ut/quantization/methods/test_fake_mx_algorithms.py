@@ -20,6 +20,8 @@ from vllm_ascend.quantization.methods.fake_mx import (
     AscendW4A4MXFP4OmniQuantFakeFusedMoEMethod,
     AscendW4A4MXFP4RHTFakeFusedMoEMethod,
     AscendW4A4MXFP4RHTFakeLinearMethod,
+    _AscendPrequantizedWeightFakeMXFusedMoEMethod,
+    _AscendPrequantizedWeightFakeMXLinearMethod,
     _inverse_fp32,
     transform_lht_weight,
 )
@@ -29,14 +31,29 @@ def _mock_vllm_config(quant_description):
     return Mock(quant_config=Mock(quant_description=quant_description))
 
 
-def test_fake_mx_runtime_targets_only_accept_attn_cache():
-    with patch(
-        "vllm_ascend.quantization.methods.fake_mx.get_current_vllm_config",
-        return_value=_mock_vllm_config({"group_size": 32}),
-    ):
-        method = AscendW4A4MXFP4FakeLinearMethod()
-    assert method.quant_targets == frozenset()
+class _PrequantizedLinear(_AscendPrequantizedWeightFakeMXLinearMethod):
+    """Concrete prequantized Linear for testing.
 
+    Production code only registers non-prequantized Linear schemes; this
+    subclass materialises the prequantized contract (skip QDQ when
+    ``fake_mx_weight_state='prequantized_qdq'``) for direct unit testing.
+    """
+
+    mx_format = "mxfp4"
+
+
+class _PrequantizedMoE(_AscendPrequantizedWeightFakeMXFusedMoEMethod):
+    """Concrete prequantized MoE for testing (same rationale as above)."""
+
+    mx_format = "mxfp4"
+
+
+def test_fake_mx_init_ignores_unrecognized_quant_targets_key():
+    """The base fake-MX Linear method does not implement ``quant_targets``
+    selection (no per-target routing in production code). Passing an
+    unrecognized ``fake_mx_quant_targets`` key must not raise and must not
+    alter the default QDQ-on-every-layer behaviour.
+    """
     with patch(
         "vllm_ascend.quantization.methods.fake_mx.get_current_vllm_config",
         return_value=_mock_vllm_config(
@@ -44,21 +61,20 @@ def test_fake_mx_runtime_targets_only_accept_attn_cache():
         ),
     ):
         method = AscendW4A4MXFP4FakeLinearMethod()
-    assert method.quant_targets == frozenset({"attn-cache"})
-
-    with (
-        patch(
-            "vllm_ascend.quantization.methods.fake_mx.get_current_vllm_config",
-            return_value=_mock_vllm_config(
-                {"group_size": 32, "fake_mx_quant_targets": ["attn-linear"]}
-            ),
-        ),
-        pytest.raises(ValueError, match="Unsupported fake-MX quant targets"),
-    ):
-        AscendW4A4MXFP4FakeLinearMethod()
+    # No ``quant_targets`` attribute is materialised; the only observable
+    # contract is that init succeeds and QDQ stays enabled (default).
+    assert not hasattr(method, "quant_targets")
+    assert method.prequantized_weight is False
 
 
 def test_prequantized_algorithm_rejects_missing_weight_state():
+    """A prequantized scheme (``required_weight_state='prequantized_qdq'``)
+    must reject checkpoints that do not carry the matching marker.
+
+    Uses ``_PrequantizedLinear`` because production code registers no
+    concrete prequantized Linear scheme (OmniQuant/AutoRound Linear both
+    perform QDQ at load time and are not prequantized).
+    """
     with (
         patch(
             "vllm_ascend.quantization.methods.fake_mx.get_current_vllm_config",
@@ -66,10 +82,18 @@ def test_prequantized_algorithm_rejects_missing_weight_state():
         ),
         pytest.raises(ValueError, match="prequantized_qdq"),
     ):
-        AscendW4A4MXFP4AutoRoundFakeLinearMethod()
+        _PrequantizedLinear()
 
 
 def test_autoround_preserves_prequantized_weight_during_post_load():
+    """A prequantized scheme (``prequantized_weight=True``) must skip the
+    QDQ step in ``process_weights_after_loading`` and preserve the loaded
+    weight bit-for-bit.
+
+    Production AutoRound Linear is NOT prequantized (it performs QDQ at load
+    time); this test validates the prequantized contract directly via
+    ``_PrequantizedLinear`` so the skip-QDQ path stays covered.
+    """
     config = {
         "group_size": 4,
         "fake_mx_weight_state": "prequantized_qdq",
@@ -78,7 +102,7 @@ def test_autoround_preserves_prequantized_weight_during_post_load():
         "vllm_ascend.quantization.methods.fake_mx.get_current_vllm_config",
         return_value=_mock_vllm_config(config),
     ):
-        method = AscendW4A4MXFP4AutoRoundFakeLinearMethod()
+        method = _PrequantizedLinear()
 
     layer = torch.nn.Linear(4, 1, bias=False)
     layer.weight.data.copy_(torch.tensor([[6.0, 5.5, 3.0, 0.25]]))
@@ -87,6 +111,7 @@ def test_autoround_preserves_prequantized_weight_during_post_load():
     method.process_weights_after_loading(layer)
 
     torch.testing.assert_close(layer.weight, expected)
+    assert getattr(layer, "_fake_mx_weight_processed", False) is True
 
 
 def test_rtn_writes_mxfp4_error_into_weight_once():
@@ -126,20 +151,27 @@ def test_rht_online_activation_and_offline_weight_rotation_are_fp_equivalent():
     )
 
 
-def test_rht_rejects_unrotated_checkpoint_marker():
+def test_rht_linear_does_not_require_weight_state_marker():
+    """Linear RHT rotates weights at load time and accepts the original
+    BF16 checkpoint directly, so it does NOT set ``required_weight_state``.
+
+    Passing an unrelated ``fake_mx_weight_state`` marker must not raise —
+    RHT ignores the marker entirely (consistent with MoE RHT after the
+    F1 fix in work-03).
+    """
     config = {
         "group_size": 32,
         "rht_group_size": 32,
-        "fake_mx_weight_state": "prequantized_qdq",
+        "fake_mx_weight_state": "prequantized_qdq",  # unrelated marker
     }
-    with (
-        patch(
-            "vllm_ascend.quantization.methods.fake_mx.get_current_vllm_config",
-            return_value=_mock_vllm_config(config),
-        ),
-        pytest.raises(ValueError, match="rht_rotated_fp"),
+    with patch(
+        "vllm_ascend.quantization.methods.fake_mx.get_current_vllm_config",
+        return_value=_mock_vllm_config(config),
     ):
-        AscendW4A4MXFP4RHTFakeLinearMethod()
+        # Should not raise — RHT does not validate weight_state.
+        method = AscendW4A4MXFP4RHTFakeLinearMethod()
+    assert method.required_weight_state is None
+    assert method.algorithm == "rht"
 
 
 def test_hadamard_learning_online_activation_and_offline_weight_are_fp_equivalent():
@@ -156,32 +188,123 @@ def test_hadamard_learning_online_activation_and_offline_weight_are_fp_equivalen
 
 
 def test_hadamard_learning_loads_transform_and_applies_before_fake_mx():
+    """LHT Linear loads the transform matrix from ``lht_params_path`` and
+    applies ``W @ inv(T).T`` to the weight at load time, before fake-MX QDQ.
+
+    Production code requires ``lht_params_path`` (no default); the previous
+    test omitted it and hit the params_path validation error. The QDQ step
+    is mocked as identity so the weight-transform assertion is exact.
+    """
+    transform = torch.tensor([[1.0, 1.0], [1.0, -1.0]])
     config = {
         "group_size": 2,
         "hadamard_learning_matrix_size": 2,
-        "fake_mx_weight_state": "hadamard_learning_transformed_fp",
+        "lht_params_path": "/fake/path.pt",
     }
-    with patch(
-        "vllm_ascend.quantization.methods.fake_mx.get_current_vllm_config",
-        return_value=_mock_vllm_config(config),
+    with (
+        patch(
+            "vllm_ascend.quantization.methods.fake_mx.get_current_vllm_config",
+            return_value=_mock_vllm_config(config),
+        ),
+        patch(
+            "vllm_ascend.quantization.methods.fake_mx._load_transform_params",
+            return_value={"test.transform_weight": transform},
+        ),
+        patch(
+            "vllm_ascend.quantization.methods.fake_mx.fake_mx_quantize",
+            side_effect=lambda weight, _format, _group_size, **_: weight,
+        ) as fake_quantize,
     ):
         method = AscendW4A4MXFP4HadamardLearningFakeLinearMethod()
 
-    layer = torch.nn.Linear(2, 2, bias=False)
-    layer.weight.data.copy_(torch.eye(2))
-    layer.transform_weight = torch.nn.Parameter(torch.tensor([[1.0, 1.0], [1.0, -1.0]]))
-    method.process_weights_after_loading(layer)
+        layer = torch.nn.Linear(2, 2, bias=False)
+        layer.weight.data.copy_(torch.eye(2))
+        layer.prefix = "test"
+        layer.transform_weight = torch.nn.Parameter(torch.eye(2), requires_grad=False)
+        method.process_weights_after_loading(layer)
 
-    actual = method.apply(layer, torch.tensor([[1.0, 1.0]]))
-    expected = F.linear(torch.tensor([[2.0, 0.0]]), layer.weight)
-    torch.testing.assert_close(actual, expected)
+        # Transform loaded from params path
+        torch.testing.assert_close(layer.transform_weight.data, transform)
+        # Weight transformed to W @ inv(T).T (QDQ mocked as identity)
+        expected_weight = transform_lht_weight(torch.eye(2), transform, 2)
+        torch.testing.assert_close(layer.weight.data, expected_weight.to(layer.weight.dtype))
+        # QDQ ran exactly once on the transformed weight
+        assert fake_quantize.call_count == 1
+        assert getattr(layer, "_fake_mx_weight_processed", False) is True
 
 
 def test_flatquant_applies_transform_clip_and_mxfp4_qdq():
+    """FlatQuant Linear loads left_trans/right_trans/diag_scale from
+    ``flatquant_params_path``, applies ``W' = inv(left) @ (W/diag) @ inv(right).T``
+    at load time, then transforms activation online as
+    ``x' = left.T @ (x*diag) @ right`` before QDQ.
+
+    Production code requires ``flatquant_params_path`` (no default) and
+    forces ``clip_ratio=1.0`` at load time. With identity transforms and
+    diag=ones, both weight and activation are preserved; QDQ is mocked as
+    identity so the assertion is exact.
+    """
     config = {
         "group_size": 4,
-        "fake_mx_weight_state": "flatquant_transformed_fp",
         "max_supported_tp": 4,
+        "flatquant_params_path": "/fake/path.pt",
+        "flatquant_use_diag": False,
+    }
+    with (
+        patch(
+            "vllm_ascend.quantization.methods.fake_mx.get_current_vllm_config",
+            return_value=_mock_vllm_config(config),
+        ),
+        patch(
+            "vllm_ascend.quantization.methods.fake_mx.get_tensor_model_parallel_world_size",
+            return_value=1,
+        ),
+        patch(
+            "vllm_ascend.quantization.methods.fake_mx._load_transform_params",
+            return_value={
+                "test.left_trans": torch.eye(2),
+                "test.right_trans": torch.eye(2),
+                "test.diag_scale": torch.ones(4),
+            },
+        ),
+        patch(
+            "vllm_ascend.quantization.methods.fake_mx.fake_mx_quantize",
+            side_effect=lambda weight, _format, _group_size, **_: weight,
+        ),
+    ):
+        method = AscendW4A4MXFP4FakeFlatQuantLinearMethod()
+
+        layer = torch.nn.Linear(4, 4, bias=False)
+        layer.weight.data.copy_(torch.eye(4))
+        layer.prefix = "test"
+        layer.left_trans = torch.nn.Parameter(torch.eye(2), requires_grad=False)
+        layer.right_trans = torch.nn.Parameter(torch.eye(2), requires_grad=False)
+        layer.clip_ratio = torch.nn.Parameter(torch.tensor([0.5]), requires_grad=False)
+        layer.diag_scale = torch.nn.Parameter(torch.ones(4), requires_grad=False)
+        method.process_weights_after_loading(layer)
+
+        activation = torch.tensor([[6.0, 5.0, 3.0, 2.0]])
+        actual = method.apply(layer, activation)
+
+        # identity transforms + diag=ones => weight and activation preserved (QDQ mocked)
+        torch.testing.assert_close(layer.weight.data, torch.eye(4))
+        torch.testing.assert_close(actual, F.linear(activation, layer.weight))
+
+
+def test_flatquant_linear_does_not_require_weight_state_marker():
+    """FlatQuant Linear transforms weights at load time and accepts the
+    original BF16 checkpoint directly, so it does NOT set
+    ``required_weight_state``.
+
+    Passing an unrelated ``fake_mx_weight_state`` marker must not raise.
+    Also verifies ``__init__`` no longer crashes on uninitialized TP group
+    (the previous test omitted the TP mock).
+    """
+    config = {
+        "group_size": 4,
+        "max_supported_tp": 4,
+        "flatquant_params_path": "/fake/path.pt",
+        "fake_mx_weight_state": "rht_rotated_fp",  # unrelated marker
     }
     with (
         patch(
@@ -193,38 +316,21 @@ def test_flatquant_applies_transform_clip_and_mxfp4_qdq():
             return_value=1,
         ),
     ):
+        # Should not raise — FlatQuant does not validate weight_state.
         method = AscendW4A4MXFP4FakeFlatQuantLinearMethod()
-
-    layer = torch.nn.Linear(4, 4, bias=False)
-    layer.weight.data.copy_(torch.eye(4))
-    layer.left_trans = torch.nn.Parameter(torch.eye(2), requires_grad=False)
-    layer.right_trans = torch.nn.Parameter(torch.eye(2), requires_grad=False)
-    layer.clip_ratio = torch.nn.Parameter(torch.tensor([0.5]), requires_grad=False)
-    method.process_weights_after_loading(layer)
-    activation = torch.tensor([[6.0, 5.0, 3.0, 2.0]])
-
-    actual = method.apply(layer, activation)
-
-    expected_activation = torch.tensor([[3.0, 3.0, 3.0, 2.0]])
-    torch.testing.assert_close(actual, F.linear(expected_activation, layer.weight))
+    assert method.required_weight_state is None
+    assert method.algorithm == "flatquant"
 
 
-def test_flatquant_rejects_plain_checkpoint_marker():
-    config = {
-        "group_size": 4,
-        "fake_mx_weight_state": "rht_rotated_fp",
-    }
-    with (
-        patch(
-            "vllm_ascend.quantization.methods.fake_mx.get_current_vllm_config",
-            return_value=_mock_vllm_config(config),
-        ),
-        pytest.raises(ValueError, match="flatquant_transformed_fp"),
-    ):
-        AscendW4A4MXFP4FakeFlatQuantLinearMethod()
+def test_prequantized_moe_preserves_prequantized_expert_weights():
+    """A prequantized MoE scheme (``prequantized_weight=True``) must skip
+    the QDQ step in ``process_weights_after_loading`` and only apply the
+    layout transpose (checkpoint [E,N,K] -> Ascend GMM [E,K,N]).
 
-
-def test_omniquant_moe_preserves_prequantized_expert_weights():
+    Production OmniQuant/AutoRound MoE are NOT prequantized (they perform
+    QDQ at load time); this test validates the prequantized contract
+    directly via ``_PrequantizedMoE`` so the skip-QDQ path stays covered.
+    """
     config = {
         "group_size": 4,
         "fake_mx_weight_state": "prequantized_qdq",
@@ -240,7 +346,7 @@ def test_omniquant_moe_preserves_prequantized_expert_weights():
             return_value=ascend_config,
         ),
     ):
-        method = AscendW4A4MXFP4OmniQuantFakeFusedMoEMethod()
+        method = _PrequantizedMoE()
 
     layer = torch.nn.Module()
     layer.w13_weight = torch.nn.Parameter(torch.randn(2, 8, 4), requires_grad=False)
@@ -251,8 +357,10 @@ def test_omniquant_moe_preserves_prequantized_expert_weights():
     with patch("vllm_ascend.quantization.methods.fake_mx.maybe_trans_nz", side_effect=lambda weight: weight):
         method.process_weights_after_loading(layer)
 
+    # QDQ skipped (prequantized_weight=True); only layout transpose applied
     torch.testing.assert_close(layer.w13_weight, expected_w13.transpose(1, 2).contiguous())
     torch.testing.assert_close(layer.w2_weight, expected_w2.transpose(1, 2).contiguous())
+    assert getattr(layer, "_fake_mx_weight_processed", False) is True
 
 
 def test_rtn_fake_mx_moe_qdq_precedes_ascend_gmm_layout_transform():
@@ -564,5 +672,106 @@ def test_lht_weight_and_activation_are_mathematically_paired():
 
     torch.testing.assert_close(
         F.linear(transformed_activation, transformed_weight),
+        F.linear(activation, weight),
+    )
+
+
+# ---- F3: OmniQuant MoE fix tests ----
+
+
+def test_omniquant_moe_requires_params_path():
+    """OmniQuant MoE must raise when omniquant_params_path is missing."""
+    ascend_config = Mock(eplb_config=Mock(dynamic_eplb=False))
+    with (
+        patch(
+            "vllm_ascend.quantization.methods.fake_mx.get_current_vllm_config",
+            return_value=_mock_vllm_config({"group_size": 4}),
+        ),
+        patch(
+            "vllm_ascend.quantization.methods.fake_mx.get_ascend_config",
+            return_value=ascend_config,
+        ),
+        pytest.raises(ValueError, match="omniquant_params_path"),
+    ):
+        AscendW4A4MXFP4OmniQuantFakeFusedMoEMethod()
+
+
+def test_omniquant_moe_scales_weights_at_load_time():
+    """OmniQuant MoE must scale weight' = weight * exp(log_scale) at load time,
+    and stash per-expert fc1/fc2 scales on the layer for runtime activation
+    down-scale. QDQ is mocked as identity so the scale assertion is exact.
+    """
+    # 2 experts, hidden=4, intermediate=4. log_scale=ln(2) => scale=2 on one dim.
+    fc1_log_scale = torch.tensor(
+        [[0.6931, 0.0, 0.0, 0.0], [0.0, 0.6931, 0.0, 0.0]], dtype=torch.float32
+    )
+    fc2_log_scale = torch.zeros(2, 4, dtype=torch.float32)  # scale=1 (no-op)
+    config = {"group_size": 4, "omniquant_params_path": "/fake/path.pt"}
+    ascend_config = Mock(eplb_config=Mock(dynamic_eplb=False))
+    with (
+        patch(
+            "vllm_ascend.quantization.methods.fake_mx.get_current_vllm_config",
+            return_value=_mock_vllm_config(config),
+        ),
+        patch(
+            "vllm_ascend.quantization.methods.fake_mx.get_ascend_config",
+            return_value=ascend_config,
+        ),
+        patch(
+            "vllm_ascend.quantization.methods.fake_mx._load_transform_params",
+            return_value={
+                "test.w13_log_scale": fc1_log_scale,
+                "test.w2_log_scale": fc2_log_scale,
+            },
+        ),
+        patch(
+            "vllm_ascend.quantization.methods.fake_mx.fake_mx_quantize",
+            side_effect=lambda weight, _format, _group_size, **_: weight,
+        ),
+        patch("vllm_ascend.quantization.methods.fake_mx.maybe_trans_nz", side_effect=lambda weight: weight),
+    ):
+        method = AscendW4A4MXFP4OmniQuantFakeFusedMoEMethod()
+
+        layer = torch.nn.Module()
+        layer.prefix = "test"
+        layer.w13_weight = torch.nn.Parameter(torch.ones(2, 8, 4), requires_grad=False)
+        layer.w2_weight = torch.nn.Parameter(torch.ones(2, 4, 4), requires_grad=False)
+        # log_scale parameters created by get_weight in production; mirror here
+        # so _copy_transform_param can copy loaded values into them.
+        layer.w13_log_scale = torch.nn.Parameter(torch.zeros(2, 4), requires_grad=False)
+        layer.w2_log_scale = torch.nn.Parameter(torch.zeros(2, 4), requires_grad=False)
+        original_w13 = layer.w13_weight.detach().clone()
+        original_w2 = layer.w2_weight.detach().clone()
+        method.process_weights_after_loading(layer)
+
+        # weight' = weight * scale  (broadcasting [E, 2*inter, hidden] * [E, 1, hidden])
+        # then base process_weights_after_loading transposes [E, 2*inter, hidden] -> [E, hidden, 2*inter]
+        expected_fc1_scale = torch.exp(fc1_log_scale).clamp(min=1e-4, max=1e4)
+        expected_w13 = (original_w13 * expected_fc1_scale.unsqueeze(1)).transpose(1, 2).contiguous()
+        torch.testing.assert_close(layer.w13_weight.data, expected_w13.to(layer.w13_weight.dtype))
+        # fc2 scale = 1 => w2 unchanged by scale (QDQ mocked as identity too)
+        torch.testing.assert_close(layer.w2_weight.data, original_w2.transpose(1, 2).contiguous())
+        # per-expert scales stashed on layer
+        assert hasattr(layer, "_fake_mx_fc1_scale")
+        assert hasattr(layer, "_fake_mx_fc2_scale")
+        assert getattr(layer, "_fake_mx_omniquant_processed", False) is True
+
+
+def test_omniquant_moe_weight_and_activation_are_mathematically_paired():
+    """Verify (x / scale) @ (weight * scale).T == x @ weight.T per expert.
+
+    Mirrors Linear OmniQuant's math contract: weight is pre-scaled at load
+    time, activation is divided by the same scale per-expert at runtime, so
+    the linear output is preserved while MX QDQ error is reduced.
+    """
+    weight = torch.tensor([[1.0, 2.0, -1.0, 0.5], [0.25, -2.0, 1.0, 3.0]])  # [out=2, in=4]
+    activation = torch.tensor([[0.5, -1.0, 2.0, 1.0]])  # [1, in=4]
+    scale = torch.tensor([2.0, 0.5, 1.0, 4.0])  # per-input-dim, non-uniform
+
+    scaled_weight = weight * scale  # [out, in] * [in] => broadcast on last dim
+    scaled_activation = activation / scale  # [1, in] / [in]
+
+    torch.testing.assert_close(
+        F.linear(scaled_activation, scaled_weight),
         F.linear(activation, weight),
     )

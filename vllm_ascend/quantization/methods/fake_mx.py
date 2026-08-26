@@ -994,10 +994,12 @@ class _AscendFakeMXFusedMoEMethod(AscendMoEScheme):
         topk_weights = topk_weights.to(x.dtype)
         if self.algorithm == "rht":
             x = hadamard_transform(x, self.rht_matrix_size)
-        # Per-expert learned matrices can only be selected after token
-        # dispatch.  Its FC1 transform and QDQ therefore run in moe_mlp.py.
+        # Per-expert learned matrices / OmniQuant scales can only be selected
+        # after token dispatch.  Their FC1 transform and QDQ therefore run in
+        # moe_mlp.py.
         quantized_x = (
-            x if self.algorithm == "hadamard_learning" else fake_mx_quantize(x, self.mx_format, self.group_size)
+            x if self.algorithm in ("hadamard_learning", "omniquant")
+            else fake_mx_quantize(x, self.mx_format, self.group_size)
         )
         moe_comm_method = _EXTRA_CTX.moe_comm_method
         if moe_comm_method is None:
@@ -1030,6 +1032,8 @@ class _AscendFakeMXFusedMoEMethod(AscendMoEScheme):
                 fake_mx_rht_group_size=self.rht_matrix_size,
                 fake_mx_w13_transform=getattr(layer, "w13_transform_weight", None),
                 fake_mx_w2_transform=getattr(layer, "w2_transform_weight", None),
+                fake_mx_omniquant_fc1_scale=getattr(layer, "_fake_mx_fc1_scale", None),
+                fake_mx_omniquant_fc2_scale=getattr(layer, "_fake_mx_fc2_scale", None),
                 w1_bias=layer.w13_bias if has_bias else None,
                 w2_bias=layer.w2_bias if has_bias else None,
                 w1_scale=None,
@@ -1057,16 +1061,88 @@ class _AscendPrequantizedWeightFakeMXFusedMoEMethod(_AscendFakeMXFusedMoEMethod)
     required_weight_state = "prequantized_qdq"
 
 
-@register_scheme("W4A4_MXFP4_OMNIQUANT_FAKE", "moe")
-class AscendW4A4MXFP4OmniQuantFakeFusedMoEMethod(_AscendFakeMXFusedMoEMethod):
-    mx_format: FakeMXFormat = "mxfp4"
+class _AscendOmniQuantFakeMXFusedMoEMethod(_AscendFakeMXFusedMoEMethod):
+    """OmniQuant for MoE: per-expert per-dimension log-scale transform.
+
+    Loads per-expert ``log_scale`` for FC1 (w13, input dim = hidden) and
+    FC2 (w2, input dim = intermediate) from external params. Weight is
+    scaled up by ``exp(log_scale)`` at load time, and the activation is
+    scaled down per-expert before QDQ, preserving the linear output
+    while reducing MX QDQ error — same math as Linear OmniQuant, applied
+    per-expert.
+    """
+
     algorithm = "omniquant"
+    supports_pertensor_layer_type = True
+
+    def __init__(self):
+        super().__init__()
+        quant_description = _quant_description()
+        self.params_path = quant_description.get("omniquant_params_path")
+        if not self.params_path:
+            raise ValueError("OmniQuant MoE requires omniquant_params_path.")
+
+    def get_weight(
+        self,
+        num_experts: int,
+        intermediate_size_per_partition: int,
+        hidden_sizes: int,
+        params_dtype: torch.dtype,
+    ) -> dict[str, Any]:
+        weights = super().get_weight(
+            num_experts, intermediate_size_per_partition, hidden_sizes, params_dtype
+        )
+        weights.update(
+            {
+                # per-expert per-input-dim log_scale; FC1 input = hidden, FC2 input = intermediate.
+                "w13_log_scale": torch.zeros(num_experts, hidden_sizes, dtype=torch.float32),
+                "w2_log_scale": torch.zeros(
+                    num_experts, intermediate_size_per_partition, dtype=torch.float32
+                ),
+            }
+        )
+        return weights
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if not getattr(layer, "_fake_mx_omniquant_processed", False):
+            params = _load_transform_params(self.params_path)
+            _copy_transform_param(layer.w13_log_scale.data, params, layer, "w13_log_scale")
+            _copy_transform_param(layer.w2_log_scale.data, params, layer, "w2_log_scale")
+
+            fc1_scale = torch.exp(layer.w13_log_scale.data.to(torch.float32)).clamp(min=1e-4, max=1e4)
+            fc2_scale = torch.exp(layer.w2_log_scale.data.to(torch.float32)).clamp(min=1e-4, max=1e4)
+
+            # weight' = weight * scale  (broadcasting: [E, 2*inter, hidden] * [E, 1, hidden])
+            layer.w13_weight.data.copy_(
+                (layer.w13_weight.data.to(torch.float32) * fc1_scale.unsqueeze(1)).to(
+                    layer.w13_weight.data.dtype
+                )
+            )
+            layer.w2_weight.data.copy_(
+                (layer.w2_weight.data.to(torch.float32) * fc2_scale.unsqueeze(1)).to(
+                    layer.w2_weight.data.dtype
+                )
+            )
+            layer._fake_mx_fc1_scale = fc1_scale.to(layer.w13_weight.device)
+            layer._fake_mx_fc2_scale = fc2_scale.to(layer.w2_weight.device)
+            layer._fake_mx_omniquant_processed = True
+        layer.w13_log_scale = torch.nn.Parameter(
+            layer.w13_log_scale.data.contiguous(), requires_grad=False
+        )
+        layer.w2_log_scale = torch.nn.Parameter(
+            layer.w2_log_scale.data.contiguous(), requires_grad=False
+        )
+        super().process_weights_after_loading(layer)
+
+
+@register_scheme("W4A4_MXFP4_OMNIQUANT_FAKE", "moe")
+class AscendW4A4MXFP4OmniQuantFakeFusedMoEMethod(_AscendOmniQuantFakeMXFusedMoEMethod):
+    mx_format: FakeMXFormat = "mxfp4"
 
 
 @register_scheme("W8A8_MXFP8_OMNIQUANT_FAKE", "moe")
-class AscendW8A8MXFP8OmniQuantFakeFusedMoEMethod(_AscendFakeMXFusedMoEMethod):
+class AscendW8A8MXFP8OmniQuantFakeFusedMoEMethod(_AscendOmniQuantFakeMXFusedMoEMethod):
     mx_format: FakeMXFormat = "mxfp8"
-    algorithm = "omniquant"
 
 
 @register_scheme("W4A4_MXFP4_AUTOROUND_FAKE", "moe")

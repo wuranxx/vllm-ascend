@@ -199,6 +199,58 @@ def _apply_expert_flatquant(
     return torch.cat(outputs, dim=0) if outputs else hidden_states
 
 
+def _apply_expert_omniquant(
+    hidden_states: torch.Tensor,
+    fc_scale: torch.Tensor,
+    group_list: torch.Tensor,
+    group_list_type: int,
+) -> torch.Tensor:
+    """Apply per-expert OmniQuant activation scale: x' = x / scale[expert].
+
+    Dispatched tokens are arranged by local physical expert. group_list
+    describes token boundaries per expert. We split by expert, divide the
+    segment by that expert's per-dimension scale, then concatenate back.
+
+    The weight was pre-multiplied by the same scale at load time
+    (``process_weights_after_loading``), so ``(x / scale) @ (weight * scale).T
+    == x @ weight.T`` and the linear output is preserved while MX QDQ error
+    is reduced (same math as Linear OmniQuant, applied per-expert).
+
+    Note: ``end_tensor.item()`` triggers a device-to-host sync, matching the
+    pattern in ``_apply_expert_learned_hadamard`` / ``_apply_expert_flatquant``.
+    Batched device-side implementation should replace this once validated.
+    """
+    num_experts = fc_scale.shape[0]
+    if hidden_states.shape[0] == 0:
+        return hidden_states
+
+    boundaries = cumsum_group_list(
+        group_list, group_list_type, 0,
+        active_num=hidden_states.shape[0],
+        expert_num=num_experts,
+    )
+    if boundaries.numel() != num_experts:
+        raise ValueError(
+            "MoE OmniQuant group_list does not match local scales: "
+            f"{boundaries.numel()} groups vs {num_experts} experts."
+        )
+
+    outputs: list[torch.Tensor] = []
+    start = 0
+    for expert_idx, end_tensor in enumerate(boundaries):
+        end = int(end_tensor.item())
+        if end < start or end > hidden_states.shape[0]:
+            raise ValueError("MoE OmniQuant received invalid expert token boundaries.")
+        if end > start:
+            seg = hidden_states[start:end]
+            scale = fc_scale[expert_idx].to(seg.dtype)
+            outputs.append(seg / scale)
+        start = end
+    if start != hidden_states.shape[0]:
+        raise ValueError("MoE OmniQuant group_list does not cover all dispatched tokens.")
+    return torch.cat(outputs, dim=0) if outputs else hidden_states
+
+
 def _require_single_tensor_for_swiglu_quant(
     tensor_or_list: list[torch.Tensor] | torch.Tensor, *, name: str
 ) -> torch.Tensor:
@@ -509,6 +561,8 @@ def unquant_apply_mlp(
     fake_mx_w2_transform: torch.Tensor | None = None,
     fake_mx_flatquant_fc1_state: dict[str, torch.Tensor] | None = None,
     fake_mx_flatquant_fc2_state: dict[str, torch.Tensor] | None = None,
+    fake_mx_omniquant_fc1_scale: torch.Tensor | None = None,
+    fake_mx_omniquant_fc2_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if need_trans:
         w1 = w1.transpose(1, 2)
@@ -538,6 +592,22 @@ def unquant_apply_mlp(
         hidden_states = _apply_expert_flatquant(
             hidden_states,
             fake_mx_flatquant_fc1_state,
+            group_list,
+            group_list_type,
+        )
+        hidden_states = fake_mx_quantize(
+            hidden_states,
+            fake_mx_format,
+            fake_mx_group_size,
+        )
+    elif fake_mx_algorithm == "omniquant":
+        if fake_mx_omniquant_fc1_scale is None:
+            raise ValueError("fake-MX OmniQuant requires per-expert FC1 scale.")
+        if fake_mx_format is None:
+            raise ValueError("fake-MX OmniQuant requires a fake MX format.")
+        hidden_states = _apply_expert_omniquant(
+            hidden_states,
+            fake_mx_omniquant_fc1_scale,
             group_list,
             group_list_type,
         )
@@ -616,6 +686,15 @@ def unquant_apply_mlp(
         gate_up_out = _apply_expert_flatquant(
             gate_up_out,
             fake_mx_flatquant_fc2_state,
+            group_list,
+            group_list_type,
+        )
+    elif fake_mx_algorithm == "omniquant":
+        if fake_mx_omniquant_fc2_scale is None:
+            raise ValueError("fake-MX OmniQuant requires per-expert FC2 scale.")
+        gate_up_out = _apply_expert_omniquant(
+            gate_up_out,
+            fake_mx_omniquant_fc2_scale,
             group_list,
             group_list_type,
         )
@@ -703,6 +782,8 @@ def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
             fake_mx_w2_transform=mlp_compute_input.quant.fake_mx_w2_transform,
             fake_mx_flatquant_fc1_state=mlp_compute_input.quant.fake_mx_flatquant_fc1_state,
             fake_mx_flatquant_fc2_state=mlp_compute_input.quant.fake_mx_flatquant_fc2_state,
+            fake_mx_omniquant_fc1_scale=mlp_compute_input.quant.fake_mx_omniquant_fc1_scale,
+            fake_mx_omniquant_fc2_scale=mlp_compute_input.quant.fake_mx_omniquant_fc2_scale,
         )
 
     assert w1_scale is not None and w2_scale is not None

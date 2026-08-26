@@ -75,6 +75,11 @@ class MoEQuantParams:
     # to per-expert tensors shaped [num_local_experts, ...].
     fake_mx_flatquant_fc1_state: dict[str, torch.Tensor] | None = None
     fake_mx_flatquant_fc2_state: dict[str, torch.Tensor] | None = None
+    # OmniQuant per-expert activation scale for MoE OmniQuant fake scheme.
+    # Shaped [num_local_experts, input_dim]; activation is divided by the
+    # matching expert scale before QDQ (weight was pre-scaled at load time).
+    fake_mx_omniquant_fc1_scale: torch.Tensor | None = None
+    fake_mx_omniquant_fc2_scale: torch.Tensor | None = None
 
     @property
     def is_quant(self) -> bool:

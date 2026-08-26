@@ -1,0 +1,17 @@
+{
+  "default_quant_type": "FLOAT",
+  "group_size": 32,
+  "fake_mx_backend": "reference",
+  "module_quant_overrides": {
+    "*embed_tokens*": "FLOAT",
+    "*lm_head*": "FLOAT",
+    "*visual*": "FLOAT",
+    "*shared_expert_gate*": "FLOAT",
+    "*mlp.gate*": "FLOAT",
+    "*self_attn*": "FLOAT",
+    "*linear_attn*": "FLOAT",
+    "*shared_expert*": "W4A4_MXFP4_FAKE",
+    "*mlp.experts*": "W4A4_MXFP4_FAKE",
+    "*": "FLOAT"
+  }
+}
