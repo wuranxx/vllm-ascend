@@ -33,7 +33,6 @@ from vllm_ascend.quantization.fake_mx import (
     hadamard_transform,
     learned_hadamard_transform,
 )
-from vllm_ascend.quantization.methods.fake_mx import transform_flatquant_activation
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import (
     dispose_tensor,
@@ -148,6 +147,10 @@ def _apply_expert_flatquant(
     matching the pattern in ``_apply_expert_learned_hadamard``.  Batched
     device-side implementation should replace this once the math is validated.
     """
+    # Lazy import to break circular dependency:
+    # methods/fake_mx imports ops → moe_mlp → methods/fake_mx (transform_flatquant_activation)
+    from vllm_ascend.quantization.methods.fake_mx import transform_flatquant_activation
+
     left_trans = fc_state["left_trans"]      # [E, L, L]
     right_trans = fc_state["right_trans"]    # [E, R, R]
     diag_scale = fc_state.get("diag_scale")  # [E, K] or None
