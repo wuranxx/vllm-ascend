@@ -47,6 +47,17 @@ def _quant_description() -> dict[str, Any]:
     return get_current_vllm_config().quant_config.quant_description
 
 
+def _layer_prefix(layer: torch.nn.Module) -> str:
+    """Get the full module path from a layer.
+
+    vLLM's Linear modules (RowParallelLinear, ColumnParallelLinear) set
+    ``self.prefix`` in ``__init__``.  vLLM's FusedMoE module (RoutedExperts)
+    stores the same value as ``self.layer_name`` instead.  Return whichever
+    is available so sidecar key construction works for both Linear and MoE.
+    """
+    return getattr(layer, "prefix", "") or getattr(layer, "layer_name", "") or ""
+
+
 def _resolve_model_artifact(path: str) -> str:
     """Resolve an algorithm artifact relative to the loaded model."""
     if os.path.isabs(path):
@@ -74,7 +85,7 @@ def _load_transform_params(path: str) -> dict[str, torch.Tensor]:
 
 def _layer_prefix_candidates(layer: torch.nn.Module) -> tuple[str, ...]:
     """Map vLLM layer prefixes to the prefixes emitted by AMCT exporters."""
-    prefix = getattr(layer, "prefix", "") or ""
+    prefix = _layer_prefix(layer)
     logical_prefixes = [prefix]
     if prefix.endswith(".gate_up_proj"):
         # vLLM physically fuses the logical gate/up projections. AMCT exports
@@ -120,7 +131,7 @@ def _copy_transform_param(
     match = _find_transform_param(params, layer, suffix)
     if match is None:
         if required:
-            prefix = getattr(layer, "prefix", "") or "<unknown>"
+            prefix = _layer_prefix(layer) or "<unknown>"
             raise KeyError(f"Missing {suffix!r} transform parameter for layer {prefix!r}.")
         return None
 
@@ -765,7 +776,7 @@ class _AscendFakeMXFlatQuantLinearMethod(_AscendFakeMXLinearMethod):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if not getattr(layer, "_fake_mx_flatquant_weight_transformed", False):
             ext_params = self._load_external_params()
-            layer_prefix = getattr(layer, "prefix", "") or ""
+            layer_prefix = _layer_prefix(layer)
             left_key = _copy_transform_param(layer.left_trans.data, ext_params, layer, "left_trans")
             _copy_transform_param(layer.right_trans.data, ext_params, layer, "right_trans")
             _copy_transform_param(layer.diag_scale.data, ext_params, layer, "diag_scale", required=self.use_diag_scale)
@@ -909,7 +920,7 @@ class _AscendFakeMXFusedMoEMethod(AscendMoEScheme):
             # Load per-expert transform matrices from sidecar.
             if self.params_path and not getattr(layer, "_fake_mx_lht_loaded", False):
                 ext_params = _load_transform_params(self.params_path)
-                layer_prefix = getattr(layer, "prefix", "") or ""
+                layer_prefix = _layer_prefix(layer)
                 expert_map = getattr(layer, "_expert_map", None)
                 if expert_map is not None:
                     phy_to_logical = {
@@ -1343,7 +1354,7 @@ class _AscendFakeMXFlatQuantFusedMoEMethod(_AscendFakeMXFusedMoEMethod):
         rank).  When ``expert_map`` is None (EP=1), physical slot equals
         logical ID and no reverse lookup is needed.
         """
-        layer_prefix = getattr(layer, "prefix", "") or ""
+        layer_prefix = _layer_prefix(layer)
         num_experts = getattr(layer, "fc1_left_trans").shape[0]
 
         # Build physical_slot -> logical_expert_id reverse mapping.
