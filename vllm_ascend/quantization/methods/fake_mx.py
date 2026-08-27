@@ -823,6 +823,8 @@ class _AscendFakeMXFusedMoEMethod(AscendMoEScheme):
             quant_description.get("hadamard_learning_matrix_size", DEFAULT_TRANSFORM_MATRIX_SIZE)
         )
         self.params_path = quant_description.get("lht_params_path") if self.algorithm == "hadamard_learning" else None
+        if self.algorithm == "hadamard_learning" and not self.params_path:
+            raise ValueError("Hadamard Learning MoE requires lht_params_path.")
         _validate_weight_state(self.algorithm, self.required_weight_state, quant_description)
         self.dynamic_eplb = get_ascend_config().eplb_config.dynamic_eplb
         if self.dynamic_eplb:
@@ -887,6 +889,45 @@ class _AscendFakeMXFusedMoEMethod(AscendMoEScheme):
                 raise ValueError(
                     f"Hadamard Learning MoE input dimensions must be divisible by matrix_size ({matrix_size})."
                 )
+            # Load per-expert transform matrices from sidecar.
+            if self.params_path and not getattr(layer, "_fake_mx_lht_loaded", False):
+                ext_params = _load_transform_params(self.params_path)
+                layer_prefix = getattr(layer, "prefix", "") or ""
+                expert_map = getattr(layer, "_expert_map", None)
+                if expert_map is not None:
+                    phy_to_logical = {
+                        int(expert_map[lid].item()): lid
+                        for lid in range(expert_map.numel())
+                        if int(expert_map[lid].item()) != -1
+                    }
+                else:
+                    phy_to_logical = None
+                for comp_name, fc_short in [
+                    ("w13_transform_weight", "w13"),
+                    ("w2_transform_weight", "w2"),
+                ]:
+                    param = getattr(layer, comp_name)
+                    for slot in range(param.shape[0]):
+                        logical_e = (
+                            slot
+                            if phy_to_logical is None
+                            else phy_to_logical.get(slot, slot)
+                        )
+                        key = _build_flatquant_sidecar_key(
+                            layer_prefix, logical_e, fc_short, "transform_weight"
+                        )
+                        if key in ext_params:
+                            param.data[slot].copy_(
+                                ext_params[key].to(
+                                    device=param.device, dtype=param.dtype
+                                )
+                            )
+                        else:
+                            logger.warning_once(
+                                "LHT sidecar missing key %s; using identity.",
+                                key,
+                            )
+                layer._fake_mx_lht_loaded = True
             if not getattr(layer, "_fake_mx_lht_weight_transformed", False):
                 for expert_idx in range(layer.w13_weight.shape[0]):
                     layer.w13_weight.data[expert_idx].copy_(
