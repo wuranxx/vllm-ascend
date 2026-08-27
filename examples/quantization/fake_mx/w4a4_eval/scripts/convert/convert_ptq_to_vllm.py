@@ -446,6 +446,91 @@ def convert_lht_moe(ptq_dir, output_path, num_experts=256):
     print(f"  Actual:   {len(output_tensors)}")
 
 
+def convert_omniquant_moe(ptq_dir, output_path, num_experts=256):
+    """Convert MoE OmniQuant PTQ params to vllm-ascend sidecar safetensors.
+
+    AMCT MoE OmniQuant produces one .pt file per (layer, expert):
+    ``layer_{N}_expert_{E}.pt``.  Each file contains ``input_transform``
+    (w13/FC1) and ``hidden_transform`` (w2/FC2), each with ``log_scale``
+    (a per-dimension scale vector).
+
+    Unlike FlatQuant/LHT MoE which use per-expert sidecar keys, OmniQuant
+    MoE uses ``_copy_transform_param`` which loads a per-LAYER tensor
+    ``[E, dim]`` at once.  So this function stacks per-expert log_scales
+    into per-layer tensors.
+
+    Sidecar key format (matches ``_layer_prefix_candidates`` in
+    ``fake_mx.py``)::
+
+        model.language_model.layers.{N}.mlp.experts.w13_log_scale  [E, hidden]
+        model.language_model.layers.{N}.mlp.experts.w2_log_scale   [E, intermediate]
+
+    Note: The OmniQuant MoE loader copies the entire per-layer tensor, so
+    the sidecar must have the same expert count as the local rank.
+    Works with EP=1 (all 256 experts).  For EP>1 the sidecar shape must
+    match the per-rank local expert count.
+    """
+    import re
+
+    layer_pattern = re.compile(r"^layer_(\d+)_expert_0\.pt$")
+    layer_indices = sorted(
+        int(layer_pattern.match(f).group(1))
+        for f in os.listdir(ptq_dir)
+        if layer_pattern.match(f)
+    )
+    if not layer_indices:
+        raise FileNotFoundError(
+            f"No layer_N_expert_0.pt files found in {ptq_dir}"
+        )
+    num_layers = layer_indices[-1] + 1
+    print(f"Detected {num_layers} layers, {num_experts} experts per layer.")
+
+    output_tensors = {}
+    total = num_layers
+    done = 0
+    for layer_idx in range(num_layers):
+        w13_scales = []
+        w2_scales = []
+        for expert_idx in range(num_experts):
+            pt_path = os.path.join(
+                ptq_dir, f"layer_{layer_idx}_expert_{expert_idx}.pt"
+            )
+            if not os.path.exists(pt_path):
+                w13_scales.append(None)
+                w2_scales.append(None)
+                continue
+            params = torch.load(pt_path, map_location="cpu", weights_only=False)
+            flat = _flatten_ptq_params(params)
+            w13_scales.append(flat["input_transform.log_scale"].to(torch.float32))
+            w2_scales.append(flat["hidden_transform.log_scale"].to(torch.float32))
+
+        # Fill missing experts with zeros (shape from first available).
+        ref_w13 = next((s for s in w13_scales if s is not None), None)
+        ref_w2 = next((s for s in w2_scales if s is not None), None)
+        if ref_w13 is None:
+            print(f"WARNING: no expert files for layer {layer_idx}, skipping")
+            done += 1
+            continue
+        for i in range(len(w13_scales)):
+            if w13_scales[i] is None:
+                w13_scales[i] = torch.zeros_like(ref_w13)
+            if w2_scales[i] is None:
+                w2_scales[i] = torch.zeros_like(ref_w2)
+
+        prefix = f"model.language_model.layers.{layer_idx}.mlp.experts"
+        output_tensors[f"{prefix}.w13_log_scale"] = torch.stack(w13_scales, dim=0)
+        output_tensors[f"{prefix}.w2_log_scale"] = torch.stack(w2_scales, dim=0)
+        done += 1
+        if done % 10 == 0:
+            print(f"  Processed {done}/{total} layers ({100*done//total}%)...")
+
+    save_file(output_tensors, output_path)
+    expected = num_layers * 2
+    print(f"Saved {len(output_tensors)} tensors to {output_path}")
+    print(f"  Expected: {expected} tensors (w13_log_scale + w2_log_scale per layer)")
+    print(f"  Actual:   {len(output_tensors)}")
+
+
 def merge_safetensors(paths, output_path):
     """合并多个 safetensors 文件。"""
     merged = {}
@@ -780,6 +865,8 @@ def main():
             convert_omniquant_attn(args.ptq_dir, args.output)
         elif args.target == "mlp":
             convert_omniquant_mlp(args.ptq_dir, args.output)
+        elif args.target == "moe":
+            convert_omniquant_moe(args.ptq_dir, args.output, args.num_experts)
     elif args.algo == "autoround":
         if args.target == "attn-linear":
             convert_autoround_attn(args.ptq_dir, args.output, args.model_dir)

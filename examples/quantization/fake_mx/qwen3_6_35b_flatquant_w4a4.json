@@ -16,6 +16,7 @@
     "*shared_expert.gate_proj*": "W4A4_MXFP4_FAKE",
     "*shared_expert.up_proj*": "W4A4_MXFP4_FAKE",
     "*shared_expert.down_proj*": "W4A4_MXFP4_FAKE",
+    "*mtp*": "FLOAT",
     "*mlp.experts*": "W4A4_MXFP4_FLATQUANT_FAKE",
     "*": "FLOAT"
   }

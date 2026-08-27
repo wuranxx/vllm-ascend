@@ -544,7 +544,7 @@ def test_lht_weight_formula_uses_inv_t_transpose():
 def test_lht_moe_no_longer_requires_weight_state():
     """MoE LHT should not require fake_mx_weight_state marker."""
     ascend_config = Mock(eplb_config=Mock(dynamic_eplb=False))
-    config = {"group_size": 2, "hadamard_learning_matrix_size": 2}
+    config = {"group_size": 2, "hadamard_learning_matrix_size": 2, "lht_params_path": "dummy.safetensors"}
     with (
         patch(
             "vllm_ascend.quantization.methods.fake_mx.get_current_vllm_config",
@@ -559,13 +559,13 @@ def test_lht_moe_no_longer_requires_weight_state():
         method = AscendW4A4MXFP4HadamardLearningFakeFusedMoEMethod()
     assert method.algorithm == "hadamard_learning"
     assert method.required_weight_state is None
-    assert method.params_path is None  # no lht_params_path in config
+    assert method.params_path == "dummy.safetensors"
 
 
 def test_lht_moe_get_weight_initializes_transform_to_identity():
     """get_weight should initialize transform weights to identity, not empty."""
     ascend_config = Mock(eplb_config=Mock(dynamic_eplb=False))
-    config = {"group_size": 2, "hadamard_learning_matrix_size": 2}
+    config = {"group_size": 2, "hadamard_learning_matrix_size": 2, "lht_params_path": "dummy.safetensors"}
     with (
         patch(
             "vllm_ascend.quantization.methods.fake_mx.get_current_vllm_config",
@@ -594,7 +594,7 @@ def test_lht_moe_get_weight_initializes_transform_to_identity():
 def test_lht_moe_transforms_weights_per_expert_at_load_time():
     """MoE LHT should apply per-expert W @ inv(T).T at load time."""
     ascend_config = Mock(eplb_config=Mock(dynamic_eplb=False))
-    config = {"group_size": 2, "hadamard_learning_matrix_size": 2}
+    config = {"group_size": 2, "hadamard_learning_matrix_size": 2, "lht_params_path": "dummy.safetensors"}
     with (
         patch(
             "vllm_ascend.quantization.methods.fake_mx.get_current_vllm_config",
@@ -639,6 +639,10 @@ def test_lht_moe_transforms_weights_per_expert_at_load_time():
     )
     original_w13 = layer.w13_weight.detach().clone()
     original_w2 = layer.w2_weight.detach().clone()
+
+    # Skip sidecar loading: the test pre-sets transform weights and
+    # verifies the weight transform math, not the sidecar I/O path.
+    layer._fake_mx_lht_loaded = True
 
     with (
         patch(

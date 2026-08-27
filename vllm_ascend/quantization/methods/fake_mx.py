@@ -737,7 +737,10 @@ class _AscendFakeMXFlatQuantLinearMethod(_AscendFakeMXLinearMethod):
             "left_trans": torch.eye(left_trans_dim, dtype=torch.float32),
             "right_trans": torch.eye(right_trans_dim, dtype=torch.float32),
             "clip_ratio": torch.ones(1, dtype=torch.float32),
-            "diag_scale": torch.ones(self.input_size, dtype=torch.float32),
+            "diag_scale": torch.ones(
+                self.input_size * self.tp_size if layer_type == "row" else self.input_size,
+                dtype=torch.float32,
+            ),
         }
 
     def apply(
@@ -768,6 +771,27 @@ class _AscendFakeMXFlatQuantLinearMethod(_AscendFakeMXLinearMethod):
             _copy_transform_param(layer.diag_scale.data, ext_params, layer, "diag_scale", required=self.use_diag_scale)
             layer.clip_ratio.data.fill_(1.0)
             logger.debug("FlatQuant: loaded %s for %s", left_key, layer_prefix)
+
+            # Split left_trans and diag_scale for RowParallelLinear TP
+            # *before* the weight transform so that per-partition transform
+            # matrices match the per-partition weight loaded by the weight
+            # loader.  left_trans and diag_scale are initialized at full
+            # size for "row" layers (see get_pertensor_param) to match the
+            # full-size sidecar tensors from AMCT.
+            if isinstance(layer, RowParallelLinear):
+                left_dim = layer.left_trans.data.shape[0]
+                left_block_size = left_dim // layer.tp_size
+                layer.left_trans.data = layer.left_trans.data[
+                    layer.tp_rank * left_block_size : (layer.tp_rank + 1) * left_block_size,
+                    layer.tp_rank * left_block_size : (layer.tp_rank + 1) * left_block_size,
+                ]
+                if hasattr(layer, "diag_scale") and layer.diag_scale is not None:
+                    diag_size = layer.diag_scale.data.shape[0]
+                    diag_block_size = diag_size // layer.tp_size
+                    layer.diag_scale.data = layer.diag_scale.data[
+                        layer.tp_rank * diag_block_size : (layer.tp_rank + 1) * diag_block_size
+                    ]
+
             left_dim = layer.left_trans.data.shape[0]
             right_dim = layer.right_trans.data.shape[0]
             diag = layer.diag_scale.data if hasattr(layer, "diag_scale") and layer.diag_scale is not None else None
@@ -776,13 +800,6 @@ class _AscendFakeMXFlatQuantLinearMethod(_AscendFakeMXLinearMethod):
             )
             layer.weight.data.copy_(transformed_weight.to(layer.weight.data.dtype))
             layer._fake_mx_flatquant_weight_transformed = True
-        if isinstance(layer, RowParallelLinear):
-            left_dim = layer.left_trans.data.shape[0]
-            left_block_size = left_dim // layer.tp_size
-            layer.left_trans.data = layer.left_trans.data[
-                layer.tp_rank * left_block_size : (layer.tp_rank + 1) * left_block_size,
-                layer.tp_rank * left_block_size : (layer.tp_rank + 1) * left_block_size,
-            ]
 
         layer.left_trans = torch.nn.Parameter(layer.left_trans.data.contiguous(), requires_grad=False)
         layer.right_trans = torch.nn.Parameter(layer.right_trans.data.contiguous(), requires_grad=False)
@@ -1243,7 +1260,13 @@ def _build_flatquant_sidecar_key(
             layer_idx = parts[i + 1]
             break
     if layer_idx is None:
-        return f"{layer_prefix}.{fc_name}.{comp}"
+        raise ValueError(
+            f"FlatQuant MoE sidecar key cannot be built: layer prefix "
+            f"{layer_prefix!r} does not contain 'layers.{{N}}'. "
+            f"This usually means the FusedMoE layer has no 'prefix' "
+            f"attribute set (e.g. MTP layers). Add '\"*mtp*\": \"FLOAT\"' "
+            f"to module_quant_overrides to exclude MTP from FlatQuant."
+        )
 
     comp_short = "diag" if comp == "diag_scale" else comp
     return f"layers.{layer_idx}.experts.{expert_idx}.{fc_name}.{comp_short}"
