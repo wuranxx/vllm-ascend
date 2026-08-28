@@ -94,6 +94,20 @@ def _apply_expert_learned_hadamard(
     if hidden_states.shape[0] == 0:
         return hidden_states
 
+    # npu_moe_init_routing may pad sorted_hidden_states to active_num,
+    # but group_list only counts actual dispatched tokens.  Trim to the
+    # actual count so per-expert boundaries cover all rows, then append
+    # the padding tail unchanged.
+    actual_tokens = int(group_list.sum().item())
+    padded_tail = None
+    if actual_tokens < hidden_states.shape[0]:
+        padded_tail = hidden_states[actual_tokens:]
+        hidden_states = hidden_states[:actual_tokens]
+    elif actual_tokens > hidden_states.shape[0]:
+        raise ValueError(
+            f"Hadamard Learning group_list sum ({actual_tokens}) exceeds hidden_states rows ({hidden_states.shape[0]})."
+        )
+
     boundaries = cumsum_group_list(
         group_list,
         group_list_type,
@@ -123,6 +137,8 @@ def _apply_expert_learned_hadamard(
         start = end
     if start != hidden_states.shape[0]:
         raise ValueError("MoE Hadamard Learning group_list does not cover all dispatched tokens.")
+    if padded_tail is not None:
+        outputs.append(padded_tail)
     return torch.cat(outputs, dim=0) if outputs else hidden_states
 
 
@@ -158,6 +174,20 @@ def _apply_expert_flatquant(
     num_experts = left_trans.shape[0]
     if hidden_states.shape[0] == 0:
         return hidden_states
+
+    # npu_moe_init_routing may pad sorted_hidden_states to active_num,
+    # but group_list only counts actual dispatched tokens.  Trim to the
+    # actual count so per-expert boundaries cover all rows, then append
+    # the padding tail unchanged.
+    actual_tokens = int(group_list.sum().item())
+    padded_tail = None
+    if actual_tokens < hidden_states.shape[0]:
+        padded_tail = hidden_states[actual_tokens:]
+        hidden_states = hidden_states[:actual_tokens]
+    elif actual_tokens > hidden_states.shape[0]:
+        raise ValueError(
+            f"FlatQuant group_list sum ({actual_tokens}) exceeds hidden_states rows ({hidden_states.shape[0]})."
+        )
 
     boundaries = cumsum_group_list(
         group_list, group_list_type, 0,
@@ -196,6 +226,8 @@ def _apply_expert_flatquant(
         start = end
     if start != hidden_states.shape[0]:
         raise ValueError("MoE FlatQuant group_list does not cover all dispatched tokens.")
+    if padded_tail is not None:
+        outputs.append(padded_tail)
     return torch.cat(outputs, dim=0) if outputs else hidden_states
 
 
@@ -224,6 +256,20 @@ def _apply_expert_omniquant(
     if hidden_states.shape[0] == 0:
         return hidden_states
 
+    # npu_moe_init_routing may pad sorted_hidden_states to active_num,
+    # but group_list only counts actual dispatched tokens.  Trim to the
+    # actual count so per-expert boundaries cover all rows, then append
+    # the padding tail unchanged.
+    actual_tokens = int(group_list.sum().item())
+    padded_tail = None
+    if actual_tokens < hidden_states.shape[0]:
+        padded_tail = hidden_states[actual_tokens:]
+        hidden_states = hidden_states[:actual_tokens]
+    elif actual_tokens > hidden_states.shape[0]:
+        raise ValueError(
+            f"OmniQuant group_list sum ({actual_tokens}) exceeds hidden_states rows ({hidden_states.shape[0]})."
+        )
+
     boundaries = cumsum_group_list(
         group_list, group_list_type, 0,
         active_num=hidden_states.shape[0],
@@ -248,6 +294,8 @@ def _apply_expert_omniquant(
         start = end
     if start != hidden_states.shape[0]:
         raise ValueError("MoE OmniQuant group_list does not cover all dispatched tokens.")
+    if padded_tail is not None:
+        outputs.append(padded_tail)
     return torch.cat(outputs, dim=0) if outputs else hidden_states
 
 
