@@ -15,9 +15,12 @@
 # This file is a part of the vllm-ascend project.
 
 
+from collections.abc import Callable
+
 import torch
 import torch_npu
 from torch.nn.functional import pad
+from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.triton_utils import HAS_TRITON
 
@@ -65,9 +68,7 @@ def cumsum_group_list(
     if src_list_type == 2 and dst_list_type == 0:
         experts = pad(group_list[:, 0], (1, 0))
         tokens = pad(group_list[:, 1].cumsum(dim=0), (1, 0))
-        cumsum_group_list = torch.full(
-            size=(expert_num,), fill_value=active_num, dtype=group_list.dtype, device=group_list.device
-        )
+        cumsum_group_list = tokens[-1].expand(expert_num).clone()
 
         for i, (start, end) in enumerate(zip(experts[:-1], experts[1:])):
             if end > start:
@@ -78,6 +79,55 @@ def cumsum_group_list(
         f"Conversion from src_list_type={src_list_type} to dst_list_type={dst_list_type} is not implemented yet. "
         "This feature is under development."
     )
+
+
+def _apply_per_expert_transform(
+    hidden_states: torch.Tensor,
+    group_list: torch.Tensor,
+    group_list_type: int,
+    num_experts: int,
+    transform_name: str,
+    transform: Callable[[torch.Tensor, int], torch.Tensor],
+) -> torch.Tensor:
+    """Transform dispatched expert rows and preserve any padded tail."""
+    if group_list_type == 2:
+        message = (
+            "Per-expert fake-MX activation transforms do not support group_list_type=2 because "
+            "key-value expert IDs cannot be mapped to local transforms without expert-range metadata. "
+            "Use group_list_type 0 or 1."
+        )
+        logger.error(message)
+        raise NotImplementedError(message)
+
+    if hidden_states.shape[0] == 0:
+        return hidden_states
+
+    boundaries = cumsum_group_list(
+        group_list,
+        group_list_type,
+        0,
+        active_num=hidden_states.shape[0],
+        expert_num=num_experts,
+    )
+    if boundaries.numel() != num_experts:
+        raise ValueError(
+            f"{transform_name} group_list does not match local transforms: "
+            f"{boundaries.numel()} groups vs {num_experts} transforms."
+        )
+
+    outputs: list[torch.Tensor] = []
+    start = 0
+    for expert_idx, end_tensor in enumerate(boundaries):
+        end = int(end_tensor.item())
+        if end < start or end > hidden_states.shape[0]:
+            raise ValueError(f"{transform_name} received invalid expert token boundaries.")
+        if end > start:
+            outputs.append(transform(hidden_states[start:end], expert_idx))
+        start = end
+
+    if start < hidden_states.shape[0]:
+        outputs.append(hidden_states[start:])
+    return torch.cat(outputs, dim=0) if outputs else hidden_states
 
 
 def _apply_expert_learned_hadamard(
@@ -91,55 +141,18 @@ def _apply_expert_learned_hadamard(
         raise ValueError(
             f"MoE Hadamard Learning transform must have shape [experts, K, K], got {tuple(transform_weight.shape)}."
         )
-    if hidden_states.shape[0] == 0:
-        return hidden_states
 
-    # npu_moe_init_routing may pad sorted_hidden_states to active_num,
-    # but group_list only counts actual dispatched tokens.  Trim to the
-    # actual count so per-expert boundaries cover all rows, then append
-    # the padding tail unchanged.
-    actual_tokens = int(group_list.sum().item())
-    padded_tail = None
-    if actual_tokens < hidden_states.shape[0]:
-        padded_tail = hidden_states[actual_tokens:]
-        hidden_states = hidden_states[:actual_tokens]
-    elif actual_tokens > hidden_states.shape[0]:
-        raise ValueError(
-            f"Hadamard Learning group_list sum ({actual_tokens}) exceeds hidden_states rows ({hidden_states.shape[0]})."
-        )
+    def transform_expert(segment: torch.Tensor, expert_idx: int) -> torch.Tensor:
+        return learned_hadamard_transform(segment, transform_weight[expert_idx])
 
-    boundaries = cumsum_group_list(
+    return _apply_per_expert_transform(
+        hidden_states,
         group_list,
         group_list_type,
-        0,
-        active_num=hidden_states.shape[0],
-        expert_num=transform_weight.shape[0],
+        transform_weight.shape[0],
+        "MoE Hadamard Learning",
+        transform_expert,
     )
-    if boundaries.numel() != transform_weight.shape[0]:
-        raise ValueError(
-            "MoE Hadamard Learning group_list does not match local transforms: "
-            f"{boundaries.numel()} groups vs {transform_weight.shape[0]} matrices."
-        )
-
-    outputs: list[torch.Tensor] = []
-    start = 0
-    for expert_idx, end_tensor in enumerate(boundaries):
-        end = int(end_tensor.item())
-        if end < start or end > hidden_states.shape[0]:
-            raise ValueError("MoE Hadamard Learning received invalid expert token boundaries.")
-        if end > start:
-            outputs.append(
-                learned_hadamard_transform(
-                    hidden_states[start:end],
-                    transform_weight[expert_idx],
-                )
-            )
-        start = end
-    if start != hidden_states.shape[0]:
-        raise ValueError("MoE Hadamard Learning group_list does not cover all dispatched tokens.")
-    if padded_tail is not None:
-        outputs.append(padded_tail)
-    return torch.cat(outputs, dim=0) if outputs else hidden_states
 
 
 def _apply_expert_flatquant(
@@ -172,63 +185,36 @@ def _apply_expert_flatquant(
     diag_scale = fc_state.get("diag_scale")  # [E, K] or None
 
     num_experts = left_trans.shape[0]
-    if hidden_states.shape[0] == 0:
-        return hidden_states
 
-    # npu_moe_init_routing may pad sorted_hidden_states to active_num,
-    # but group_list only counts actual dispatched tokens.  Trim to the
-    # actual count so per-expert boundaries cover all rows, then append
-    # the padding tail unchanged.
-    actual_tokens = int(group_list.sum().item())
-    padded_tail = None
-    if actual_tokens < hidden_states.shape[0]:
-        padded_tail = hidden_states[actual_tokens:]
-        hidden_states = hidden_states[:actual_tokens]
-    elif actual_tokens > hidden_states.shape[0]:
-        raise ValueError(
-            f"FlatQuant group_list sum ({actual_tokens}) exceeds hidden_states rows ({hidden_states.shape[0]})."
-        )
-
-    boundaries = cumsum_group_list(
-        group_list, group_list_type, 0,
-        active_num=hidden_states.shape[0],
-        expert_num=num_experts,
-    )
-    if boundaries.numel() != num_experts:
-        raise ValueError(
-            "MoE FlatQuant group_list does not match local transforms: "
-            f"{boundaries.numel()} groups vs {num_experts} matrices."
-        )
-
-    outputs: list[torch.Tensor] = []
-    start = 0
-    for expert_idx, end_tensor in enumerate(boundaries):
-        end = int(end_tensor.item())
-        if end < start or end > hidden_states.shape[0]:
-            raise ValueError("MoE FlatQuant received invalid expert token boundaries.")
-        if end > start:
-            seg = hidden_states[start:end]
-            L = left_trans[expert_idx]       # [L_dim, L_dim]
-            R = right_trans[expert_idx]      # [R_dim, R_dim]
-            left_dim = L.shape[0]
-            right_dim = R.shape[0]
-            input_dim = seg.shape[-1]
-            if left_dim * right_dim != input_dim:
-                raise ValueError(
-                    f"FlatQuant transform dimension mismatch: left({left_dim}) * right({right_dim}) "
-                    f"!= input({input_dim}) for expert {expert_idx}."
-                )
-            diag = diag_scale[expert_idx] if diag_scale is not None else None
-            transformed = transform_flatquant_activation(
-                seg, L, R, diag, left_dim, right_dim
+    def transform_expert(segment: torch.Tensor, expert_idx: int) -> torch.Tensor:
+        left = left_trans[expert_idx]
+        right = right_trans[expert_idx]
+        left_dim = left.shape[0]
+        right_dim = right.shape[0]
+        input_dim = segment.shape[-1]
+        if left_dim * right_dim != input_dim:
+            raise ValueError(
+                f"FlatQuant transform dimension mismatch: left({left_dim}) * right({right_dim}) "
+                f"!= input({input_dim}) for expert {expert_idx}."
             )
-            outputs.append(transformed)
-        start = end
-    if start != hidden_states.shape[0]:
-        raise ValueError("MoE FlatQuant group_list does not cover all dispatched tokens.")
-    if padded_tail is not None:
-        outputs.append(padded_tail)
-    return torch.cat(outputs, dim=0) if outputs else hidden_states
+        diag = diag_scale[expert_idx] if diag_scale is not None else None
+        return transform_flatquant_activation(
+            segment,
+            left,
+            right,
+            diag,
+            left_dim,
+            right_dim,
+        )
+
+    return _apply_per_expert_transform(
+        hidden_states,
+        group_list,
+        group_list_type,
+        num_experts,
+        "MoE FlatQuant",
+        transform_expert,
+    )
 
 
 def _apply_expert_omniquant(
@@ -253,50 +239,18 @@ def _apply_expert_omniquant(
     Batched device-side implementation should replace this once validated.
     """
     num_experts = fc_scale.shape[0]
-    if hidden_states.shape[0] == 0:
-        return hidden_states
 
-    # npu_moe_init_routing may pad sorted_hidden_states to active_num,
-    # but group_list only counts actual dispatched tokens.  Trim to the
-    # actual count so per-expert boundaries cover all rows, then append
-    # the padding tail unchanged.
-    actual_tokens = int(group_list.sum().item())
-    padded_tail = None
-    if actual_tokens < hidden_states.shape[0]:
-        padded_tail = hidden_states[actual_tokens:]
-        hidden_states = hidden_states[:actual_tokens]
-    elif actual_tokens > hidden_states.shape[0]:
-        raise ValueError(
-            f"OmniQuant group_list sum ({actual_tokens}) exceeds hidden_states rows ({hidden_states.shape[0]})."
-        )
+    def transform_expert(segment: torch.Tensor, expert_idx: int) -> torch.Tensor:
+        return segment / fc_scale[expert_idx].to(segment.dtype)
 
-    boundaries = cumsum_group_list(
-        group_list, group_list_type, 0,
-        active_num=hidden_states.shape[0],
-        expert_num=num_experts,
+    return _apply_per_expert_transform(
+        hidden_states,
+        group_list,
+        group_list_type,
+        num_experts,
+        "MoE OmniQuant",
+        transform_expert,
     )
-    if boundaries.numel() != num_experts:
-        raise ValueError(
-            "MoE OmniQuant group_list does not match local scales: "
-            f"{boundaries.numel()} groups vs {num_experts} experts."
-        )
-
-    outputs: list[torch.Tensor] = []
-    start = 0
-    for expert_idx, end_tensor in enumerate(boundaries):
-        end = int(end_tensor.item())
-        if end < start or end > hidden_states.shape[0]:
-            raise ValueError("MoE OmniQuant received invalid expert token boundaries.")
-        if end > start:
-            seg = hidden_states[start:end]
-            scale = fc_scale[expert_idx].to(seg.dtype)
-            outputs.append(seg / scale)
-        start = end
-    if start != hidden_states.shape[0]:
-        raise ValueError("MoE OmniQuant group_list does not cover all dispatched tokens.")
-    if padded_tail is not None:
-        outputs.append(padded_tail)
-    return torch.cat(outputs, dim=0) if outputs else hidden_states
 
 
 def _require_single_tensor_for_swiglu_quant(

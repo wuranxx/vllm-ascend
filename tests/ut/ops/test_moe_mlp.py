@@ -6,7 +6,9 @@ import torch
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 
 from vllm_ascend.ops.fused_moe.moe_mlp import (
+    _apply_expert_flatquant,
     _apply_expert_learned_hadamard,
+    _apply_expert_omniquant,
     cumsum_group_list,
     unified_apply_mlp,
     unquant_apply_mlp,
@@ -33,7 +35,7 @@ class TestCumsumGroupList(unittest.TestCase):
             2: torch.tensor([[1, 2], [2, 1], [0, 0], [0, 0]]),
         }
 
-    support_combine = [(0, 0), (1, 0), (0, 1)]
+    support_combine = [(0, 0), (1, 0), (2, 0), (0, 1)]
     unsupported_combine = [(0, 2), (2, 1), (1, 2)]
 
     def test_cumsum_group_list_supported_conversion(self):
@@ -71,6 +73,157 @@ class TestCumsumGroupList(unittest.TestCase):
         )
 
         torch.testing.assert_close(actual, torch.tensor([[1.0, 0.0], [0.0, 1.0], [3.0, 2.0]]))
+
+
+class TestPerExpertActivationTransforms(unittest.TestCase):
+    group_lists: ClassVar[dict[int, torch.Tensor]]
+    hidden_states: ClassVar[torch.Tensor]
+
+    @classmethod
+    def setUpClass(cls):
+        cls.group_lists = {
+            0: torch.tensor([2, 3]),
+            1: torch.tensor([2, 1]),
+        }
+        cls.hidden_states = torch.tensor(
+            [[1.0, 0.0], [0.0, 1.0], [2.0, 3.0], [9.0, 7.0]]
+        )
+
+    def test_learned_hadamard_preserves_padding_for_supported_group_list_types(self):
+        transforms = torch.stack(
+            (
+                torch.eye(2),
+                torch.tensor([[0.0, 1.0], [1.0, 0.0]]),
+            )
+        )
+        expected = torch.tensor(
+            [[1.0, 0.0], [0.0, 1.0], [3.0, 2.0], [9.0, 7.0]]
+        )
+
+        for group_list_type, group_list in self.group_lists.items():
+            for has_padding in (False, True):
+                with self.subTest(
+                    group_list_type=group_list_type,
+                    has_padding=has_padding,
+                ):
+                    rows = 4 if has_padding else 3
+                    actual = _apply_expert_learned_hadamard(
+                        self.hidden_states[:rows],
+                        transforms,
+                        group_list,
+                        group_list_type,
+                    )
+                    torch.testing.assert_close(actual, expected[:rows])
+
+    def test_flatquant_preserves_padding_for_supported_group_list_types(self):
+        fc_state = {
+            "left_trans": torch.ones((2, 1, 1)),
+            "right_trans": torch.eye(2).repeat(2, 1, 1),
+            "diag_scale": torch.tensor([[1.0, 1.0], [2.0, 1.0]]),
+        }
+        expected = torch.tensor(
+            [[1.0, 0.0], [0.0, 1.0], [4.0, 3.0], [9.0, 7.0]]
+        )
+
+        for group_list_type, group_list in self.group_lists.items():
+            for has_padding in (False, True):
+                with self.subTest(
+                    group_list_type=group_list_type,
+                    has_padding=has_padding,
+                ):
+                    rows = 4 if has_padding else 3
+                    actual = _apply_expert_flatquant(
+                        self.hidden_states[:rows],
+                        fc_state,
+                        group_list,
+                        group_list_type,
+                    )
+                    torch.testing.assert_close(actual, expected[:rows])
+
+    def test_omniquant_preserves_padding_for_supported_group_list_types(self):
+        fc_scale = torch.tensor([[1.0, 1.0], [2.0, 1.0]])
+        expected = torch.tensor(
+            [[1.0, 0.0], [0.0, 1.0], [1.0, 3.0], [9.0, 7.0]]
+        )
+
+        for group_list_type, group_list in self.group_lists.items():
+            for has_padding in (False, True):
+                with self.subTest(
+                    group_list_type=group_list_type,
+                    has_padding=has_padding,
+                ):
+                    rows = 4 if has_padding else 3
+                    actual = _apply_expert_omniquant(
+                        self.hidden_states[:rows],
+                        fc_scale,
+                        group_list,
+                        group_list_type,
+                    )
+                    torch.testing.assert_close(actual, expected[:rows])
+
+    def test_omniquant_preserves_all_padding_for_supported_group_list_types(self):
+        fc_scale = torch.tensor([[2.0, 2.0], [3.0, 3.0]])
+        hidden_states = torch.tensor([[9.0, 7.0]])
+        empty_group_lists = {
+            0: torch.tensor([0, 0]),
+            1: torch.tensor([0, 0]),
+        }
+
+        for group_list_type, group_list in empty_group_lists.items():
+            with self.subTest(group_list_type=group_list_type):
+                actual = _apply_expert_omniquant(
+                    hidden_states,
+                    fc_scale,
+                    group_list,
+                    group_list_type,
+                )
+                torch.testing.assert_close(actual, hidden_states)
+
+    def test_omniquant_returns_empty_hidden_states_unchanged(self):
+        hidden_states = torch.empty((0, 2))
+
+        actual = _apply_expert_omniquant(
+            hidden_states,
+            torch.ones((2, 2)),
+            torch.tensor([0, 0]),
+            group_list_type=0,
+        )
+
+        self.assertIs(actual, hidden_states)
+
+    def test_per_expert_transform_rejects_type_2_group_list(self):
+        with (
+            patch("vllm_ascend.ops.fused_moe.moe_mlp.logger.error") as mock_log_error,
+            self.assertRaisesRegex(
+                NotImplementedError,
+                "do not support group_list_type=2",
+            ),
+        ):
+            _apply_expert_omniquant(
+                self.hidden_states[:3],
+                torch.ones((2, 2)),
+                torch.tensor([[4, 2], [5, 1]]),
+                group_list_type=2,
+            )
+        mock_log_error.assert_called_once()
+
+    def test_omniquant_rejects_boundaries_beyond_hidden_states(self):
+        invalid_group_lists = {
+            0: torch.tensor([2, 4]),
+            1: torch.tensor([2, 2]),
+        }
+
+        for group_list_type, group_list in invalid_group_lists.items():
+            with (
+                self.subTest(group_list_type=group_list_type),
+                self.assertRaisesRegex(ValueError, "invalid expert token boundaries"),
+            ):
+                _apply_expert_omniquant(
+                    self.hidden_states[:3],
+                    torch.ones((2, 2)),
+                    group_list,
+                    group_list_type,
+                )
 
 
 class TestW4A8RuntimeFlags(unittest.TestCase):
