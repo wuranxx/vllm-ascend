@@ -3,6 +3,7 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 import torch.nn.functional as F
+from vllm.model_executor.layers.linear import RowParallelLinear
 
 from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.quantization.fake_mx import (
@@ -11,18 +12,21 @@ from vllm_ascend.quantization.fake_mx import (
     randomized_hadamard_transform,
 )
 from vllm_ascend.quantization.methods.fake_mx import (
-    AscendW4A4MXFP4AutoRoundFakeLinearMethod,
     AscendW4A4MXFP4FakeFlatQuantLinearMethod,
     AscendW4A4MXFP4FakeFusedMoEMethod,
     AscendW4A4MXFP4FakeLinearMethod,
     AscendW4A4MXFP4HadamardLearningFakeFusedMoEMethod,
     AscendW4A4MXFP4HadamardLearningFakeLinearMethod,
     AscendW4A4MXFP4OmniQuantFakeFusedMoEMethod,
+    AscendW4A4MXFP4OmniQuantFakeLinearMethod,
     AscendW4A4MXFP4RHTFakeFusedMoEMethod,
     AscendW4A4MXFP4RHTFakeLinearMethod,
     _AscendPrequantizedWeightFakeMXFusedMoEMethod,
     _AscendPrequantizedWeightFakeMXLinearMethod,
+    _copy_expert_transform_param,
     _inverse_fp32,
+    transform_flatquant_activation,
+    transform_flatquant_weight,
     transform_lht_weight,
 )
 
@@ -56,9 +60,7 @@ def test_fake_mx_init_ignores_unrecognized_quant_targets_key():
     """
     with patch(
         "vllm_ascend.quantization.methods.fake_mx.get_current_vllm_config",
-        return_value=_mock_vllm_config(
-            {"group_size": 32, "fake_mx_quant_targets": ["attn-cache"]}
-        ),
+        return_value=_mock_vllm_config({"group_size": 32, "fake_mx_quant_targets": ["attn-cache"]}),
     ):
         method = AscendW4A4MXFP4FakeLinearMethod()
     # No ``quant_targets`` attribute is materialised; the only observable
@@ -322,6 +324,77 @@ def test_flatquant_linear_does_not_require_weight_state_marker():
     assert method.algorithm == "flatquant"
 
 
+def test_flatquant_row_parallel_dense_transform_gathers_full_tp_input_and_weight():
+    """Dense row-parallel transforms must be applied before TP partitioning."""
+    config = {
+        "group_size": 1,
+        "flatquant_params_path": "/fake/path.pt",
+        "flatquant_use_diag": True,
+    }
+    left = torch.tensor([[1.0, 0.1, 0.0, 0.0], [0.0, 1.0, 0.2, 0.0], [0.0, 0.0, 1.0, 0.3], [0.1, 0.0, 0.0, 1.0]])
+    right = torch.ones(1, 1)
+    diag = torch.ones(4)
+    with (
+        patch(
+            "vllm_ascend.quantization.methods.fake_mx.get_current_vllm_config",
+            return_value=_mock_vllm_config(config),
+        ),
+        patch(
+            "vllm_ascend.quantization.methods.fake_mx.get_tensor_model_parallel_world_size",
+            return_value=2,
+        ),
+        patch(
+            "vllm_ascend.quantization.methods.fake_mx._load_transform_params",
+            return_value={
+                "test.left_trans": left,
+                "test.right_trans": right,
+                "test.diag_scale": diag,
+            },
+        ),
+        patch(
+            "vllm_ascend.quantization.methods.fake_mx.fake_mx_quantize",
+            side_effect=lambda weight, _format, _group_size, **_: weight,
+        ),
+    ):
+        method = AscendW4A4MXFP4FakeFlatQuantLinearMethod()
+        layer = RowParallelLinear.__new__(RowParallelLinear)
+        torch.nn.Module.__init__(layer)
+        layer.prefix = "test"
+        layer.tp_size = 2
+        layer.tp_rank = 1
+        layer.left_trans = torch.nn.Parameter(torch.eye(4), requires_grad=False)
+        layer.right_trans = torch.nn.Parameter(torch.eye(1), requires_grad=False)
+        layer.diag_scale = torch.nn.Parameter(torch.ones(4), requires_grad=False)
+        layer.clip_ratio = torch.nn.Parameter(torch.ones(1), requires_grad=False)
+        layer.weight = torch.nn.Parameter(torch.tensor([[3.0, 4.0]]), requires_grad=False)
+
+        gather_calls = 0
+
+        def gather(value, dim=-1):
+            nonlocal gather_calls
+            gather_calls += 1
+            prefix = torch.tensor([[1.0, 2.0]]) if gather_calls == 1 else torch.tensor([[5.0, 6.0]])
+            return torch.cat((prefix, value), dim=dim)
+
+        with patch(
+            "vllm_ascend.quantization.methods.fake_mx.tensor_model_parallel_all_gather",
+            side_effect=gather,
+        ):
+            method.process_weights_after_loading(layer)
+            layer.aclnn_clip_ratio = 1.0
+            actual = method.apply(layer, torch.tensor([[7.0, 8.0]]))
+
+    full_weight = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+    full_activation = torch.tensor([[5.0, 6.0, 7.0, 8.0]])
+    expected_weight = transform_flatquant_weight(full_weight, left, right, diag, 4, 1)
+    expected_activation = transform_flatquant_activation(full_activation, left, right, diag, 4, 1)
+    expected = expected_activation[:, 2:] @ expected_weight[:, 2:].t()
+    torch.testing.assert_close(actual, expected)
+    assert layer._fake_mx_flatquant_tp_full_transform is True
+    assert layer.left_trans.shape == (4, 4)
+    assert gather_calls == 2
+
+
 def test_prequantized_moe_preserves_prequantized_expert_weights():
     """A prequantized MoE scheme (``prequantized_weight=True``) must skip
     the QDQ step in ``process_weights_after_loading`` and only apply the
@@ -579,8 +652,10 @@ def test_lht_moe_get_weight_initializes_transform_to_identity():
         method = AscendW4A4MXFP4HadamardLearningFakeFusedMoEMethod()
 
     weights = method.get_weight(
-        num_experts=3, intermediate_size_per_partition=2,
-        hidden_sizes=4, params_dtype=torch.float32,
+        num_experts=3,
+        intermediate_size_per_partition=2,
+        hidden_sizes=4,
+        params_dtype=torch.float32,
     )
     assert "w13_transform_weight" in weights
     assert "w2_transform_weight" in weights
@@ -654,12 +729,12 @@ def test_lht_moe_transforms_weights_per_expert_at_load_time():
         method.process_weights_after_loading(layer)
 
     for e in range(2):
-        expected_w13_e = transform_lht_weight(
-            original_w13[e], layer.w13_transform_weight.data[e], 2
-        ).transpose(0, 1).contiguous()
-        expected_w2_e = transform_lht_weight(
-            original_w2[e], layer.w2_transform_weight.data[e], 2
-        ).transpose(0, 1).contiguous()
+        expected_w13_e = (
+            transform_lht_weight(original_w13[e], layer.w13_transform_weight.data[e], 2).transpose(0, 1).contiguous()
+        )
+        expected_w2_e = (
+            transform_lht_weight(original_w2[e], layer.w2_transform_weight.data[e], 2).transpose(0, 1).contiguous()
+        )
         torch.testing.assert_close(layer.w13_weight.data[e], expected_w13_e)
         torch.testing.assert_close(layer.w2_weight.data[e], expected_w2_e)
     assert getattr(layer, "_fake_mx_lht_weight_transformed", False) is True
@@ -706,9 +781,7 @@ def test_omniquant_moe_scales_weights_at_load_time():
     down-scale. QDQ is mocked as identity so the scale assertion is exact.
     """
     # 2 experts, hidden=4, intermediate=4. log_scale=ln(2) => scale=2 on one dim.
-    fc1_log_scale = torch.tensor(
-        [[0.6931, 0.0, 0.0, 0.0], [0.0, 0.6931, 0.0, 0.0]], dtype=torch.float32
-    )
+    fc1_log_scale = torch.tensor([[0.6931, 0.0, 0.0, 0.0], [0.0, 0.6931, 0.0, 0.0]], dtype=torch.float32)
     fc2_log_scale = torch.zeros(2, 4, dtype=torch.float32)  # scale=1 (no-op)
     config = {"group_size": 4, "omniquant_params_path": "/fake/path.pt"}
     ascend_config = Mock(eplb_config=Mock(dynamic_eplb=False))
@@ -759,6 +832,170 @@ def test_omniquant_moe_scales_weights_at_load_time():
         assert hasattr(layer, "_fake_mx_fc1_scale")
         assert hasattr(layer, "_fake_mx_fc2_scale")
         assert getattr(layer, "_fake_mx_omniquant_processed", False) is True
+
+
+def test_omniquant_moe_maps_global_scales_to_local_experts():
+    fc1_log_scale = torch.log(torch.tensor([2.0, 3.0, 5.0, 7.0])).unsqueeze(1).repeat(1, 4)
+    fc2_log_scale = torch.log(torch.tensor([11.0, 13.0, 17.0, 19.0])).unsqueeze(1).repeat(1, 4)
+    config = {"group_size": 4, "omniquant_params_path": "/fake/path.pt"}
+    ascend_config = Mock(eplb_config=Mock(dynamic_eplb=False))
+    with (
+        patch(
+            "vllm_ascend.quantization.methods.fake_mx.get_current_vllm_config",
+            return_value=_mock_vllm_config(config),
+        ),
+        patch(
+            "vllm_ascend.quantization.methods.fake_mx.get_ascend_config",
+            return_value=ascend_config,
+        ),
+        patch(
+            "vllm_ascend.quantization.methods.fake_mx._load_transform_params",
+            return_value={
+                "test.w13_log_scale": fc1_log_scale,
+                "test.w2_log_scale": fc2_log_scale,
+            },
+        ),
+        patch(
+            "vllm_ascend.quantization.methods.fake_mx.fake_mx_quantize",
+            side_effect=lambda weight, _format, _group_size, **_: weight,
+        ),
+        patch("vllm_ascend.quantization.methods.fake_mx.maybe_trans_nz", side_effect=lambda weight: weight),
+    ):
+        method = AscendW4A4MXFP4OmniQuantFakeFusedMoEMethod()
+        layer = torch.nn.Module()
+        layer.prefix = "test"
+        layer._expert_map = torch.tensor([1, -1, 0, -1])
+        layer.w13_weight = torch.nn.Parameter(torch.ones(2, 8, 4), requires_grad=False)
+        layer.w2_weight = torch.nn.Parameter(torch.ones(2, 4, 4), requires_grad=False)
+        layer.w13_log_scale = torch.nn.Parameter(torch.zeros(2, 4), requires_grad=False)
+        layer.w2_log_scale = torch.nn.Parameter(torch.zeros(2, 4), requires_grad=False)
+
+        method.process_weights_after_loading(layer)
+
+    torch.testing.assert_close(layer._fake_mx_fc1_scale, torch.tensor([[5.0] * 4, [2.0] * 4]))
+    torch.testing.assert_close(layer._fake_mx_fc2_scale, torch.tensor([[17.0] * 4, [11.0] * 4]))
+
+
+def test_omniquant_row_parallel_loads_full_scale_then_selects_tp_rank():
+    full_log_scale = torch.log(torch.tensor([[2.0, 3.0, 5.0, 7.0]]))
+    config = {"group_size": 2, "omniquant_params_path": "/fake/path.pt"}
+    with (
+        patch(
+            "vllm_ascend.quantization.methods.fake_mx.get_current_vllm_config",
+            return_value=_mock_vllm_config(config),
+        ),
+        patch(
+            "vllm_ascend.quantization.methods.fake_mx.get_tensor_model_parallel_world_size",
+            return_value=2,
+        ),
+        patch(
+            "vllm_ascend.quantization.methods.fake_mx._load_transform_params",
+            return_value={"test.log_scale": full_log_scale},
+        ),
+        patch(
+            "vllm_ascend.quantization.methods.fake_mx.fake_mx_quantize",
+            side_effect=lambda weight, _format, _group_size, **_: weight,
+        ),
+    ):
+        method = AscendW4A4MXFP4OmniQuantFakeLinearMethod()
+        method.get_weight(2, 1, torch.float32)
+        log_scale = method.get_pertensor_param(torch.float32, layer_type="row")["log_scale"]
+
+        layer = RowParallelLinear.__new__(RowParallelLinear)
+        torch.nn.Module.__init__(layer)
+        assert isinstance(layer, RowParallelLinear)
+        layer.prefix = "test"
+        layer.tp_size = 2
+        layer.tp_rank = 1
+        layer.log_scale = torch.nn.Parameter(log_scale, requires_grad=False)
+        layer.weight = torch.nn.Parameter(torch.ones(1, 2), requires_grad=False)
+        method.process_weights_after_loading(layer)
+
+    torch.testing.assert_close(layer.log_scale, full_log_scale[:, 2:])
+    torch.testing.assert_close(layer.weight, torch.tensor([[5.0, 7.0]]))
+
+
+def test_omniquant_non_row_keeps_local_scale_without_slicing():
+    config = {"group_size": 2, "omniquant_params_path": "/fake/path.pt"}
+    log_scale = torch.log(torch.tensor([[2.0, 3.0]]))
+    with (
+        patch(
+            "vllm_ascend.quantization.methods.fake_mx.get_current_vllm_config",
+            return_value=_mock_vllm_config(config),
+        ),
+        patch(
+            "vllm_ascend.quantization.methods.fake_mx.get_tensor_model_parallel_world_size",
+            return_value=2,
+        ),
+        patch(
+            "vllm_ascend.quantization.methods.fake_mx._load_transform_params",
+            return_value={"test.log_scale": log_scale},
+        ),
+        patch(
+            "vllm_ascend.quantization.methods.fake_mx.fake_mx_quantize",
+            side_effect=lambda weight, _format, _group_size, **_: weight,
+        ),
+    ):
+        method = AscendW4A4MXFP4OmniQuantFakeLinearMethod()
+        method.get_weight(2, 1, torch.float32)
+        params = method.get_pertensor_param(torch.float32, layer_type="others")
+
+        layer = torch.nn.Module()
+        layer.prefix = "test"
+        layer.log_scale = torch.nn.Parameter(params["log_scale"], requires_grad=False)
+        layer.weight = torch.nn.Parameter(torch.ones(1, 2), requires_grad=False)
+        method.process_weights_after_loading(layer)
+
+    torch.testing.assert_close(layer.log_scale, log_scale)
+    torch.testing.assert_close(layer.weight, torch.tensor([[2.0, 3.0]]))
+
+
+@pytest.mark.parametrize(
+    ("params", "target_shape", "expert_map", "expected_error", "message"),
+    [
+        pytest.param({}, (2, 4), [0, 1], KeyError, "Missing", id="missing-key"),
+        pytest.param(
+            {"test.w13_log_scale": torch.zeros(2, 3)},
+            (2, 4),
+            [0, 1],
+            ValueError,
+            "shape",
+            id="feature-shape-mismatch",
+        ),
+        pytest.param(
+            {"test.w13_log_scale": torch.zeros(3, 4)},
+            (2, 4),
+            [0, 1],
+            ValueError,
+            "has 3 experts",
+            id="expert-count-mismatch",
+        ),
+        pytest.param(
+            {"test.w13_log_scale": torch.zeros(2, 4)},
+            (1, 4),
+            [0, 1],
+            ValueError,
+            "selects 2",
+            id="local-count-mismatch",
+        ),
+        pytest.param(
+            {"test.w13_log_scale": torch.zeros(2, 4)},
+            (2, 4),
+            [0, 2],
+            ValueError,
+            "invalid local slot",
+            id="invalid-local-slot",
+        ),
+    ],
+)
+def test_omniquant_moe_rejects_invalid_expert_scale_metadata(params, target_shape, expert_map, expected_error, message):
+    layer = torch.nn.Module()
+    layer.prefix = "test"
+    layer._expert_map = torch.tensor(expert_map)
+    target = torch.zeros(*target_shape)
+
+    with pytest.raises(expected_error, match=message):
+        _copy_expert_transform_param(target, params, layer, "w13_log_scale")
 
 
 def test_omniquant_moe_weight_and_activation_are_mathematically_paired():

@@ -19,7 +19,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from vllm.config import get_current_vllm_config
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_gather
 from vllm.logger import logger
 from vllm.model_executor.layers.linear import RowParallelLinear
 
@@ -40,6 +40,7 @@ from .registry import register_scheme
 
 MAX_FLATQUANT_TRANSFORM_DIM = 256
 DEFAULT_TRANSFORM_MATRIX_SIZE = 128
+FLATQUANT_TP_BLOCK_DIAGONAL_TOLERANCE = 1e-6
 
 
 def _quant_description() -> dict[str, Any]:
@@ -139,6 +140,53 @@ def _copy_transform_param(
     if target.shape != value.shape:
         raise ValueError(f"Transform parameter {key!r} has shape {tuple(value.shape)}, expected {tuple(target.shape)}.")
     target.copy_(value.to(device=target.device, dtype=target.dtype))
+    return key
+
+
+def _copy_expert_transform_param(
+    target: torch.Tensor,
+    params: dict[str, torch.Tensor],
+    layer: torch.nn.Module,
+    suffix: str,
+) -> str:
+    """Copy a full-expert sidecar tensor into the local expert slots."""
+    expert_map = getattr(layer, "_expert_map", None)
+    if expert_map is None:
+        return _copy_transform_param(target, params, layer, suffix)
+
+    match = _find_transform_param(params, layer, suffix)
+    if match is None:
+        prefix = _layer_prefix(layer) or "<unknown>"
+        raise KeyError(f"Missing {suffix!r} transform parameter for layer {prefix!r}.")
+
+    key, value = match
+    if value.ndim != target.ndim or value.shape[1:] != target.shape[1:]:
+        raise ValueError(
+            f"Transform parameter {key!r} has shape {tuple(value.shape)}, expected "
+            f"(*, {', '.join(str(size) for size in target.shape[1:])})."
+        )
+    expert_map_values = expert_map.detach().cpu().tolist()
+    if value.shape[0] != len(expert_map_values):
+        raise ValueError(
+            f"Transform parameter {key!r} has {value.shape[0]} experts, expected "
+            f"{len(expert_map_values)} from _expert_map."
+        )
+
+    local_expert_count = sum(slot >= 0 for slot in expert_map_values)
+    if target.shape[0] != local_expert_count:
+        raise ValueError(
+            f"Transform parameter target for {key!r} has {target.shape[0]} local experts, "
+            f"but _expert_map selects {local_expert_count}."
+        )
+    for logical_expert, physical_slot in enumerate(expert_map_values):
+        if physical_slot >= 0:
+            if physical_slot >= target.shape[0]:
+                raise ValueError(
+                    f"_expert_map for {key!r} contains invalid local slot {physical_slot}."
+                )
+            target[physical_slot].copy_(
+                value[logical_expert].to(device=target.device, dtype=target.dtype)
+            )
     return key
 
 
@@ -254,6 +302,20 @@ def _validate_weight_state(algorithm: str, required: str | None, quant_descripti
         raise ValueError(f"{algorithm} fake-MX requires fake_mx_weight_state={required!r}, got {weight_state!r}.")
 
 
+def _is_tp_block_diagonal_transform(transform: torch.Tensor, tp_size: int) -> bool:
+    """Return whether a row-parallel transform has no cross-rank terms."""
+    if tp_size <= 1:
+        return True
+    if transform.ndim != 2 or transform.shape[0] != transform.shape[1] or transform.shape[0] % tp_size:
+        return False
+    block_size = transform.shape[0] // tp_size
+    off_diagonal = transform.clone()
+    for rank in range(tp_size):
+        start = rank * block_size
+        off_diagonal[start : start + block_size, start : start + block_size] = 0
+    return bool(torch.max(torch.abs(off_diagonal)).item() <= FLATQUANT_TP_BLOCK_DIAGONAL_TOLERANCE)
+
+
 class _AscendFakeMXLinearMethod(AscendLinearScheme):
     is_fake_mx = True
     mx_format: FakeMXFormat
@@ -331,18 +393,27 @@ class _AscendOmniQuantFakeMXLinearMethod(_AscendFakeMXLinearMethod):
         if not self.params_path:
             raise ValueError("OmniQuant requires omniquant_params_path.")
         self.input_size = 0
+        self.tp_size = get_tensor_model_parallel_world_size()
 
     def get_weight(self, input_size: int, output_size: int, params_dtype: torch.dtype) -> dict[str, Any]:
         self.input_size = input_size
         return super().get_weight(input_size, output_size, params_dtype)
 
     def get_pertensor_param(self, params_dtype: torch.dtype, **kwargs: Any) -> dict[str, Any]:
-        return {"log_scale": torch.zeros(1, self.input_size, dtype=params_dtype)}
+        layer_type = kwargs.get("layer_type")
+        input_size = self.input_size * self.tp_size if layer_type == "row" else self.input_size
+        return {"log_scale": torch.zeros(1, input_size, dtype=params_dtype)}
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if not getattr(layer, "_fake_mx_omniquant_processed", False):
             params = _load_transform_params(self.params_path)
             _copy_transform_param(layer.log_scale.data, params, layer, "log_scale")
+            if isinstance(layer, RowParallelLinear):
+                full_size = layer.log_scale.data.shape[1]
+                block_size = full_size // layer.tp_size
+                layer.log_scale.data = layer.log_scale.data[
+                    :, layer.tp_rank * block_size : (layer.tp_rank + 1) * block_size
+                ]
             scale = torch.exp(layer.log_scale.data.to(torch.float32)).clamp(min=1e-4, max=1e4)
             layer.weight.data.copy_((layer.weight.data.to(torch.float32) * scale).to(layer.weight.data.dtype))
             layer._fake_mx_scale = scale.to(layer.weight.device)
@@ -608,8 +679,10 @@ class _AscendRHTFakeMXLinearMethod(_AscendFakeMXLinearMethod):
     def __init__(self):
         super().__init__()
         quant_description = _quant_description()
-        self.rht_matrix_size = int(quant_description.get("rht_matrix_size",
-                                    quant_description.get("rht_group_size", self.group_size)))
+        self.rht_matrix_size = int(
+            quant_description.get("rht_matrix_size",
+                                  quant_description.get("rht_group_size", self.group_size))
+        )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if not getattr(layer, "_fake_mx_rht_weight_rotated", False):
@@ -761,15 +834,37 @@ class _AscendFakeMXFlatQuantLinearMethod(_AscendFakeMXLinearMethod):
         bias: torch.Tensor | None = None,
         tp_rank: int | None = 0,
     ) -> torch.Tensor:
-        left_dim = layer.left_trans.shape[0]
-        right_dim = layer.right_trans.shape[0]
-        if left_dim * right_dim != x.shape[-1]:
+        local_input_size = x.shape[-1]
+        if isinstance(layer, RowParallelLinear) and getattr(layer, "_fake_mx_flatquant_tp_full_transform", False):
+            full_input = tensor_model_parallel_all_gather(x, dim=-1)
+            left_dim = layer.left_trans.shape[0]
+            right_dim = layer.right_trans.shape[0]
+            transformed = transform_flatquant_activation(
+                full_input,
+                layer.left_trans,
+                layer.right_trans,
+                layer.diag_scale if hasattr(layer, "diag_scale") else None,
+                left_dim,
+                right_dim,
+            )
+            transformed = transformed.narrow(-1, layer.tp_rank * local_input_size, local_input_size)
+        else:
+            left_dim = layer.left_trans.shape[0]
+            right_dim = layer.right_trans.shape[0]
+            if left_dim * right_dim != local_input_size:
+                raise ValueError(
+                    "FlatQuant transform matrices dimension mismatch: "
+                    f"left_dim({left_dim}) * right_dim({right_dim}) != in_features({local_input_size})."
+                )
+            diag = layer.diag_scale if hasattr(layer, "diag_scale") and layer.diag_scale is not None else None
+            transformed = transform_flatquant_activation(
+                x, layer.left_trans, layer.right_trans, diag, left_dim, right_dim
+            )
+        if transformed.shape[-1] != local_input_size:
             raise ValueError(
                 "FlatQuant transform matrices dimension mismatch: "
-                f"left_dim({left_dim}) * right_dim({right_dim}) != in_features({x.shape[-1]})."
+                f"transformed features ({transformed.shape[-1]}) != in_features({local_input_size})."
             )
-        diag = layer.diag_scale if hasattr(layer, "diag_scale") and layer.diag_scale is not None else None
-        transformed = transform_flatquant_activation(x, layer.left_trans, layer.right_trans, diag, left_dim, right_dim)
         quantized_x = fake_mx_quantize(transformed, self.mx_format, self.group_size, clip_ratio=layer.aclnn_clip_ratio)
         return F.linear(quantized_x, layer.weight, bias)
 
@@ -792,24 +887,53 @@ class _AscendFakeMXFlatQuantLinearMethod(_AscendFakeMXLinearMethod):
             if isinstance(layer, RowParallelLinear):
                 left_dim = layer.left_trans.data.shape[0]
                 left_block_size = left_dim // layer.tp_size
-                layer.left_trans.data = layer.left_trans.data[
-                    layer.tp_rank * left_block_size : (layer.tp_rank + 1) * left_block_size,
-                    layer.tp_rank * left_block_size : (layer.tp_rank + 1) * left_block_size,
-                ]
-                if hasattr(layer, "diag_scale") and layer.diag_scale is not None:
-                    diag_size = layer.diag_scale.data.shape[0]
-                    diag_block_size = diag_size // layer.tp_size
-                    layer.diag_scale.data = layer.diag_scale.data[
-                        layer.tp_rank * diag_block_size : (layer.tp_rank + 1) * diag_block_size
+                left_param = _find_transform_param(ext_params, layer, "left_trans")
+                use_full_transform = left_param is not None and not _is_tp_block_diagonal_transform(
+                    left_param[1], layer.tp_size
+                )
+                layer._fake_mx_flatquant_tp_full_transform = use_full_transform
+                if use_full_transform:
+                    full_weight = tensor_model_parallel_all_gather(layer.weight.data, dim=-1)
+                    transformed_weight = transform_flatquant_weight(
+                        full_weight,
+                        layer.left_trans.data,
+                        layer.right_trans.data,
+                        layer.diag_scale.data if hasattr(layer, "diag_scale") else None,
+                        left_dim,
+                        layer.right_trans.data.shape[0],
+                    )
+                    local_start = layer.tp_rank * layer.weight.shape[-1]
+                    layer.weight.data.copy_(
+                        transformed_weight.narrow(-1, local_start, layer.weight.shape[-1]).to(layer.weight.data.dtype)
+                    )
+                else:
+                    layer.left_trans.data = layer.left_trans.data[
+                        layer.tp_rank * left_block_size : (layer.tp_rank + 1) * left_block_size,
+                        layer.tp_rank * left_block_size : (layer.tp_rank + 1) * left_block_size,
                     ]
-
-            left_dim = layer.left_trans.data.shape[0]
-            right_dim = layer.right_trans.data.shape[0]
-            diag = layer.diag_scale.data if hasattr(layer, "diag_scale") and layer.diag_scale is not None else None
-            transformed_weight = transform_flatquant_weight(
-                layer.weight.data, layer.left_trans.data, layer.right_trans.data, diag, left_dim, right_dim
-            )
-            layer.weight.data.copy_(transformed_weight.to(layer.weight.data.dtype))
+                    if hasattr(layer, "diag_scale") and layer.diag_scale is not None:
+                        diag_size = layer.diag_scale.data.shape[0]
+                        diag_block_size = diag_size // layer.tp_size
+                        layer.diag_scale.data = layer.diag_scale.data[
+                            layer.tp_rank * diag_block_size : (layer.tp_rank + 1) * diag_block_size
+                        ]
+                    left_dim = layer.left_trans.data.shape[0]
+                    right_dim = layer.right_trans.data.shape[0]
+                    diag = (
+                        layer.diag_scale.data if hasattr(layer, "diag_scale") and layer.diag_scale is not None else None
+                    )
+                    transformed_weight = transform_flatquant_weight(
+                        layer.weight.data, layer.left_trans.data, layer.right_trans.data, diag, left_dim, right_dim
+                    )
+                    layer.weight.data.copy_(transformed_weight.to(layer.weight.data.dtype))
+            else:
+                left_dim = layer.left_trans.data.shape[0]
+                right_dim = layer.right_trans.data.shape[0]
+                diag = layer.diag_scale.data if hasattr(layer, "diag_scale") and layer.diag_scale is not None else None
+                transformed_weight = transform_flatquant_weight(
+                    layer.weight.data, layer.left_trans.data, layer.right_trans.data, diag, left_dim, right_dim
+                )
+                layer.weight.data.copy_(transformed_weight.to(layer.weight.data.dtype))
             layer._fake_mx_flatquant_weight_transformed = True
 
         layer.left_trans = torch.nn.Parameter(layer.left_trans.data.contiguous(), requires_grad=False)
@@ -844,8 +968,7 @@ class _AscendFakeMXFusedMoEMethod(AscendMoEScheme):
         quant_description = _quant_description()
         self.group_size = int(quant_description.get("group_size", 32))
         self.rht_matrix_size = int(
-            quant_description.get("rht_matrix_size",
-                                  quant_description.get("rht_group_size", self.group_size))
+            quant_description.get("rht_matrix_size", quant_description.get("rht_group_size", self.group_size))
         )
         self.hadamard_learning_matrix_size = int(
             quant_description.get("hadamard_learning_matrix_size", DEFAULT_TRANSFORM_MATRIX_SIZE)
@@ -904,12 +1027,8 @@ class _AscendFakeMXFusedMoEMethod(AscendMoEScheme):
             return
         if self.algorithm == "rht":
             if not getattr(layer, "_fake_mx_rht_weight_rotated", False):
-                layer.w13_weight.data.copy_(
-                    hadamard_transform(layer.w13_weight.data, self.rht_matrix_size)
-                )
-                layer.w2_weight.data.copy_(
-                    hadamard_transform(layer.w2_weight.data, self.rht_matrix_size)
-                )
+                layer.w13_weight.data.copy_(hadamard_transform(layer.w13_weight.data, self.rht_matrix_size))
+                layer.w2_weight.data.copy_(hadamard_transform(layer.w2_weight.data, self.rht_matrix_size))
                 layer._fake_mx_rht_weight_rotated = True
         elif self.algorithm == "hadamard_learning":
             matrix_size = self.hadamard_learning_matrix_size
@@ -936,20 +1055,10 @@ class _AscendFakeMXFusedMoEMethod(AscendMoEScheme):
                 ]:
                     param = getattr(layer, comp_name)
                     for slot in range(param.shape[0]):
-                        logical_e = (
-                            slot
-                            if phy_to_logical is None
-                            else phy_to_logical.get(slot, slot)
-                        )
-                        key = _build_flatquant_sidecar_key(
-                            layer_prefix, logical_e, fc_short, "transform_weight"
-                        )
+                        logical_e = slot if phy_to_logical is None else phy_to_logical.get(slot, slot)
+                        key = _build_flatquant_sidecar_key(layer_prefix, logical_e, fc_short, "transform_weight")
                         if key in ext_params:
-                            param.data[slot].copy_(
-                                ext_params[key].to(
-                                    device=param.device, dtype=param.dtype
-                                )
-                            )
+                            param.data[slot].copy_(ext_params[key].to(device=param.device, dtype=param.dtype))
                         else:
                             logger.warning_once(
                                 "LHT sidecar missing key %s; using identity.",
@@ -1067,7 +1176,8 @@ class _AscendFakeMXFusedMoEMethod(AscendMoEScheme):
         # after token dispatch.  Their FC1 transform and QDQ therefore run in
         # moe_mlp.py.
         quantized_x = (
-            x if self.algorithm in ("hadamard_learning", "omniquant")
+            x
+            if self.algorithm in ("hadamard_learning", "omniquant")
             else fake_mx_quantize(x, self.mx_format, self.group_size)
         )
         moe_comm_method = _EXTRA_CTX.moe_comm_method
@@ -1158,16 +1268,12 @@ class _AscendOmniQuantFakeMXFusedMoEMethod(_AscendFakeMXFusedMoEMethod):
         hidden_sizes: int,
         params_dtype: torch.dtype,
     ) -> dict[str, Any]:
-        weights = super().get_weight(
-            num_experts, intermediate_size_per_partition, hidden_sizes, params_dtype
-        )
+        weights = super().get_weight(num_experts, intermediate_size_per_partition, hidden_sizes, params_dtype)
         weights.update(
             {
                 # per-expert per-input-dim log_scale; FC1 input = hidden, FC2 input = intermediate.
                 "w13_log_scale": torch.zeros(num_experts, hidden_sizes, dtype=torch.float32),
-                "w2_log_scale": torch.zeros(
-                    num_experts, intermediate_size_per_partition, dtype=torch.float32
-                ),
+                "w2_log_scale": torch.zeros(num_experts, intermediate_size_per_partition, dtype=torch.float32),
             }
         )
         return weights
@@ -1175,32 +1281,24 @@ class _AscendOmniQuantFakeMXFusedMoEMethod(_AscendFakeMXFusedMoEMethod):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if not getattr(layer, "_fake_mx_omniquant_processed", False):
             params = _load_transform_params(self.params_path)
-            _copy_transform_param(layer.w13_log_scale.data, params, layer, "w13_log_scale")
-            _copy_transform_param(layer.w2_log_scale.data, params, layer, "w2_log_scale")
+            _copy_expert_transform_param(layer.w13_log_scale.data, params, layer, "w13_log_scale")
+            _copy_expert_transform_param(layer.w2_log_scale.data, params, layer, "w2_log_scale")
 
             fc1_scale = torch.exp(layer.w13_log_scale.data.to(torch.float32)).clamp(min=1e-4, max=1e4)
             fc2_scale = torch.exp(layer.w2_log_scale.data.to(torch.float32)).clamp(min=1e-4, max=1e4)
 
             # weight' = weight * scale  (broadcasting: [E, 2*inter, hidden] * [E, 1, hidden])
             layer.w13_weight.data.copy_(
-                (layer.w13_weight.data.to(torch.float32) * fc1_scale.unsqueeze(1)).to(
-                    layer.w13_weight.data.dtype
-                )
+                (layer.w13_weight.data.to(torch.float32) * fc1_scale.unsqueeze(1)).to(layer.w13_weight.data.dtype)
             )
             layer.w2_weight.data.copy_(
-                (layer.w2_weight.data.to(torch.float32) * fc2_scale.unsqueeze(1)).to(
-                    layer.w2_weight.data.dtype
-                )
+                (layer.w2_weight.data.to(torch.float32) * fc2_scale.unsqueeze(1)).to(layer.w2_weight.data.dtype)
             )
             layer._fake_mx_fc1_scale = fc1_scale.to(layer.w13_weight.device)
             layer._fake_mx_fc2_scale = fc2_scale.to(layer.w2_weight.device)
             layer._fake_mx_omniquant_processed = True
-        layer.w13_log_scale = torch.nn.Parameter(
-            layer.w13_log_scale.data.contiguous(), requires_grad=False
-        )
-        layer.w2_log_scale = torch.nn.Parameter(
-            layer.w2_log_scale.data.contiguous(), requires_grad=False
-        )
+        layer.w13_log_scale = torch.nn.Parameter(layer.w13_log_scale.data.contiguous(), requires_grad=False)
+        layer.w2_log_scale = torch.nn.Parameter(layer.w2_log_scale.data.contiguous(), requires_grad=False)
         super().process_weights_after_loading(layer)
 
 
@@ -1256,9 +1354,7 @@ class AscendW8A8MXFP8HadamardLearningFakeFusedMoEMethod(_AscendFakeMXFusedMoEMet
     algorithm = "hadamard_learning"
 
 
-def _build_flatquant_sidecar_key(
-    layer_prefix: str, expert_idx: int, fc_name: str, comp: str
-) -> str:
+def _build_flatquant_sidecar_key(layer_prefix: str, expert_idx: int, fc_name: str, comp: str) -> str:
     """Build sidecar tensor key for a per-expert FlatQuant state.
 
     Format: layers.{N}.experts.{E}.{fc}.{comp_short}
@@ -1275,7 +1371,7 @@ def _build_flatquant_sidecar_key(
             f"FlatQuant MoE sidecar key cannot be built: layer prefix "
             f"{layer_prefix!r} does not contain 'layers.{{N}}'. "
             f"This usually means the FusedMoE layer has no 'prefix' "
-            f"attribute set (e.g. MTP layers). Add '\"*mtp*\": \"FLOAT\"' "
+            f'attribute set (e.g. MTP layers). Add \'"*mtp*": "FLOAT"\' '
             f"to module_quant_overrides to exclude MTP from FlatQuant."
         )
 
@@ -1303,9 +1399,7 @@ class _AscendFakeMXFlatQuantFusedMoEMethod(_AscendFakeMXFusedMoEMethod):
         self.flatquant_params_path = quant_description.get("flatquant_params_path")
         if not self.flatquant_params_path:
             raise ValueError("MoE FlatQuant requires flatquant_params_path.")
-        self.matrix_size = int(
-            quant_description.get("flatquant_matrix_size", DEFAULT_TRANSFORM_MATRIX_SIZE)
-        )
+        self.matrix_size = int(quant_description.get("flatquant_matrix_size", DEFAULT_TRANSFORM_MATRIX_SIZE))
         self.use_diag_scale = bool(quant_description.get("flatquant_use_diag", True))
 
     def _decompose_dim(self, dim: int) -> tuple[int, int]:
@@ -1325,26 +1419,29 @@ class _AscendFakeMXFlatQuantFusedMoEMethod(_AscendFakeMXFusedMoEMethod):
         hidden_sizes: int,
         params_dtype: torch.dtype,
     ) -> dict[str, Any]:
-        weights = super().get_weight(
-            num_experts, intermediate_size_per_partition, hidden_sizes, params_dtype
-        )
+        weights = super().get_weight(num_experts, intermediate_size_per_partition, hidden_sizes, params_dtype)
         # FC1 K = hidden_sizes, FC2 K = intermediate_size_per_partition.
         # AMCT Kronecker decomposition: left_dim * right_dim = K.
         # Prefer matrix_size as right_dim when K is divisible (matches Dense path).
         fc1_left_dim, fc1_right_dim = self._decompose_dim(hidden_sizes)
         fc2_left_dim, fc2_right_dim = self._decompose_dim(intermediate_size_per_partition)
-        weights.update({
-            "fc1_left_trans": torch.eye(fc1_left_dim, dtype=torch.float32).unsqueeze(0).repeat(num_experts, 1, 1),
-            "fc1_right_trans": torch.eye(fc1_right_dim, dtype=torch.float32).unsqueeze(0).repeat(num_experts, 1, 1),
-            "fc1_diag_scale": torch.ones(num_experts, hidden_sizes, dtype=torch.float32),
-            "fc2_left_trans": torch.eye(fc2_left_dim, dtype=torch.float32).unsqueeze(0).repeat(num_experts, 1, 1),
-            "fc2_right_trans": torch.eye(fc2_right_dim, dtype=torch.float32).unsqueeze(0).repeat(num_experts, 1, 1),
-            "fc2_diag_scale": torch.ones(num_experts, intermediate_size_per_partition, dtype=torch.float32),
-        })
+        weights.update(
+            {
+                "fc1_left_trans": torch.eye(fc1_left_dim, dtype=torch.float32).unsqueeze(0).repeat(num_experts, 1, 1),
+                "fc1_right_trans": torch.eye(fc1_right_dim, dtype=torch.float32).unsqueeze(0).repeat(num_experts, 1, 1),
+                "fc1_diag_scale": torch.ones(num_experts, hidden_sizes, dtype=torch.float32),
+                "fc2_left_trans": torch.eye(fc2_left_dim, dtype=torch.float32).unsqueeze(0).repeat(num_experts, 1, 1),
+                "fc2_right_trans": torch.eye(fc2_right_dim, dtype=torch.float32).unsqueeze(0).repeat(num_experts, 1, 1),
+                "fc2_diag_scale": torch.ones(num_experts, intermediate_size_per_partition, dtype=torch.float32),
+            }
+        )
         return weights
 
     def _load_per_expert_state(
-        self, layer: torch.nn.Module, ext_params: dict[str, torch.Tensor], fc_name: str,
+        self,
+        layer: torch.nn.Module,
+        ext_params: dict[str, torch.Tensor],
+        fc_name: str,
         expert_map: torch.Tensor | None,
     ) -> None:
         """Load FlatQuant state from sidecar into layer parameters.
@@ -1355,7 +1452,7 @@ class _AscendFakeMXFlatQuantFusedMoEMethod(_AscendFakeMXFusedMoEMethod):
         logical ID and no reverse lookup is needed.
         """
         layer_prefix = _layer_prefix(layer)
-        num_experts = getattr(layer, "fc1_left_trans").shape[0]
+        num_experts = layer.fc1_left_trans.shape[0]
 
         # Build physical_slot -> logical_expert_id reverse mapping.
         if expert_map is not None:
@@ -1373,13 +1470,9 @@ class _AscendFakeMXFlatQuantFusedMoEMethod(_AscendFakeMXFusedMoEMethod):
                 logical_e = slot if phy_to_logical is None else phy_to_logical.get(slot, slot)
                 key = _build_flatquant_sidecar_key(layer_prefix, logical_e, fc_name, comp)
                 if key in ext_params:
-                    param.data[slot].copy_(
-                        ext_params[key].to(device=param.device, dtype=param.dtype)
-                    )
+                    param.data[slot].copy_(ext_params[key].to(device=param.device, dtype=param.dtype))
                 else:
-                    logger.warning_once(
-                        "FlatQuant sidecar missing key %s; using identity.", key
-                    )
+                    logger.warning_once("FlatQuant sidecar missing key %s; using identity.", key)
 
     def _inverse_transform_and_qdq_weight(
         self,
@@ -1391,9 +1484,7 @@ class _AscendFakeMXFlatQuantFusedMoEMethod(_AscendFakeMXFusedMoEMethod):
         """Apply FlatQuant inverse weight transform, then MXFP4 QDQ."""
         left_dim = left_trans.shape[0]
         right_dim = right_trans.shape[0]
-        transformed = transform_flatquant_weight(
-            weight, left_trans, right_trans, diag_scale, left_dim, right_dim
-        )
+        transformed = transform_flatquant_weight(weight, left_trans, right_trans, diag_scale, left_dim, right_dim)
         return fake_mx_quantize(transformed.to(weight.dtype), self.mx_format, self.group_size)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -1435,8 +1526,12 @@ class _AscendFakeMXFlatQuantFusedMoEMethod(_AscendFakeMXFusedMoEMethod):
 
         # Freeze FlatQuant state as Parameters.
         for param_name in [
-            "fc1_left_trans", "fc1_right_trans", "fc1_diag_scale",
-            "fc2_left_trans", "fc2_right_trans", "fc2_diag_scale",
+            "fc1_left_trans",
+            "fc1_right_trans",
+            "fc1_diag_scale",
+            "fc2_left_trans",
+            "fc2_right_trans",
+            "fc2_diag_scale",
         ]:
             param = getattr(layer, param_name)
             setattr(layer, param_name, torch.nn.Parameter(param.data.contiguous(), requires_grad=False))
@@ -1564,6 +1659,7 @@ class _AscendFakeMXFlatQuantFusedMoEMethod(_AscendFakeMXFusedMoEMethod):
 @register_scheme("W4A4_MXFP4_FLATQUANT_FAKE", "moe")
 class AscendW4A4MXFP4FakeFlatQuantFusedMoEMethod(_AscendFakeMXFlatQuantFusedMoEMethod):
     """W4A4 MXFP4 FlatQuant fake-QDQ for FusedMoE (routed experts only)."""
+
     mx_format: FakeMXFormat = "mxfp4"
 
 
