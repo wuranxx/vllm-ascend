@@ -310,12 +310,18 @@ class AscendFusedMoEMethod(FusedMoEMethodBase):
         dynamic_quant_param = self.quant_method.get_dynamic_quant_param(
             num_experts, intermediate_size_per_partition, hidden_size, params_dtype
         )
+        param_loader_factory = getattr(self.quant_method, "moe_param_weight_loader", None)
         for param_key, param_value in dynamic_quant_param.items():
             param = torch.nn.Parameter(param_value, requires_grad=False)
             layer.register_parameter(param_key, param)
             set_weight_attrs(param, extra_weight_attrs)
             if any(fields in param_key for fields in per_group_param):
                 param.quant_method = FusedMoeWeightScaleSupported.GROUP.value
+            # Scheme-specific parameters (e.g. per-expert FlatQuant transforms)
+            # are not understood by the upstream per-channel/per-group loaders.
+            custom_loader = param_loader_factory(param_key) if param_loader_factory is not None else None
+            if custom_loader is not None:
+                param.weight_loader = custom_loader
 
     def apply(
         self,

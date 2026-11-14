@@ -52,6 +52,7 @@ from .w4a4 import (
     AscendW4A4MXFP4DynamicFusedMoEMethod,
     AscendW4A4MXFP4DynamicLinearMethod,
     AscendW4A4MXFP4FlatQuantDynamicLinearMethod,
+    AscendW4A4MXFP4FlatQuantFusedMoEMethod,
 )
 from .w4a8 import (
     AscendW4A8DynamicFusedMoEMethod,
@@ -126,6 +127,7 @@ __all__ = [
     "AscendW4A4MXFP4DynamicLinearMethod",
     "AscendW4A4MXFP4DynamicFusedMoEMethod",
     "AscendW4A4MXFP4FlatQuantDynamicLinearMethod",
+    "AscendW4A4MXFP4FlatQuantFusedMoEMethod",
     "AscendW8A8MXFP8DSDynamicLinearMethod",
     "AscendW4A8MXFPDSDynamicFusedMoEMethod",
     "AscendFp8BlockLinearMethod",

@@ -89,6 +89,10 @@ class AscendW4A4MXFP4FlatQuantDynamicLinearMethod(AscendLinearScheme):
 
         params_dict["left_trans"] = torch.empty(left_trans_dim, left_trans_dim, dtype=params_dtype)
         params_dict["right_trans"] = torch.empty(right_trans_dim, right_trans_dim, dtype=params_dtype)
+        # AMCT FlatQuant carries the learnable diagonal separately; apply it to
+        # the activation before the Kronecker transform.  Default to ones so a
+        # checkpoint without diag_scale still runs the neutral path.
+        params_dict["diag_scale"] = torch.ones(self.input_size, dtype=torch.float32)
         params_dict["clip_ratio"] = torch.empty(1, dtype=torch.float32)
         return params_dict
 
@@ -115,8 +119,12 @@ class AscendW4A4MXFP4FlatQuantDynamicLinearMethod(AscendLinearScheme):
                 f"FlatQuant transform matrices dimension mismatch: "
                 f"left_dim({left_dim}) * right_dim({right_dim}) != in_features({in_features})"
             )
+        x_reshaped = x.view(-1, left_dim, right_dim)
+        diag_scale = getattr(layer, "diag_scale", None)
+        if diag_scale is not None:
+            x_reshaped = x_reshaped * diag_scale.to(x.dtype).view(1, left_dim, right_dim)
         quantized_x, pertoken_scale = torch_npu.npu_kronecker_quant(
-            x.view(-1, left_dim, right_dim),
+            x_reshaped,
             layer.left_trans,
             layer.right_trans,
             layer.aclnn_clip_ratio,
@@ -148,8 +156,12 @@ class AscendW4A4MXFP4FlatQuantDynamicLinearMethod(AscendLinearScheme):
                     f"FlatQuant transform matrices dimension mismatch: "
                     f"left_dim({left_dim}) * right_dim({right_dim}) != in_features({in_features})"
                 )
+            x_reshaped = x.view(-1, left_dim, right_dim)
+            diag_scale = getattr(layer, "diag_scale", None)
+            if diag_scale is not None:
+                x_reshaped = x_reshaped * diag_scale.to(original_dtype).view(1, left_dim, right_dim)
             x_quantized_fp4, pertoken_scale = torch_npu.npu_kronecker_quant(
-                x.view(-1, left_dim, right_dim),
+                x_reshaped,
                 layer.left_trans,
                 layer.right_trans,
                 layer.aclnn_clip_ratio,
@@ -192,6 +204,8 @@ class AscendW4A4MXFP4FlatQuantDynamicLinearMethod(AscendLinearScheme):
         layer.weight.data = layer.weight.data.transpose(0, 1)
         layer.weight_scale.data = layer.weight_scale.data.transpose(0, 1)
 
+        if hasattr(layer, "diag_scale"):
+            layer.diag_scale = torch.nn.Parameter(layer.diag_scale.data.to(torch.float32))
         layer.left_trans = torch.nn.Parameter(layer.left_trans.data.t().contiguous())
         layer.right_trans = torch.nn.Parameter(layer.right_trans.data)
         layer.clip_ratio = torch.nn.Parameter(layer.clip_ratio.data.to(torch.float32))
